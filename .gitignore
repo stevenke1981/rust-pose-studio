@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed on purpose (this is an application).
+
+# Installer / release output
+/dist/
+
+# Local scratch output
+/out/
+*.pose.json.bak
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

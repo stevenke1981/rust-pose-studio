@@ -1,0 +1,54 @@
+[package]
+name = "rust-pose-studio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Posable 3D drawing mannequin for figure-drawing pose reference: presets, IK posing, PNG and contact-sheet export (egui/eframe)"
+license = "MIT"
+authors = ["Ke Sheng Da"]
+readme = "README.md"
+repository = "https://github.com/stevenke1981/rust-pose-studio"
+keywords = ["pose", "mannequin", "drawing", "reference", "gui"]
+categories = ["graphics", "gui"]
+
+[lib]
+name = "rust_pose_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-pose-studio"
+path = "src/main.rs"
+
+[dependencies]
+# glow (OpenGL) renderer instead of wgpu, default fonts, X11 + Wayland backends on Linux.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = { version = "0.36.2", default-features = false }
+# Native file dialogs (GTK3 backend on Linux, native APIs on Windows/macOS).
+rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
+# Offscreen software rasteriser used for PNG export (GPU independent).
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+# PNG encoding only.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# Glyph rasterisation for contact-sheet labels, using egui's bundled Ubuntu font.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+epaint_default_fonts = "0.36.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+
+# Size-optimised release build (same profile as rust-transfer-gui).
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+# Keep debug builds usable: the mannequin renderer runs per frame.
+[profile.dev.package."*"]
+opt-level = 2
