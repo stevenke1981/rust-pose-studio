@@ -7,7 +7,7 @@ use tiny_skia::Pixmap;
 
 use crate::body::Body;
 use crate::raster;
-use crate::render::{Camera, FloorStyle, Frame2, Style, View, draw_body, framing_camera};
+use crate::render::{Camera, FloorStyle, Framing, Style, View, draw_body, framing_camera};
 use crate::skeleton::{Pose, Skeleton};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,19 +18,11 @@ pub struct ImageOptions {
     /// Frame the figure tightly instead of using the camera's framing.
     pub fit: bool,
     pub floor: FloorStyle,
-    pub depth_shading: bool,
 }
 
 impl Default for ImageOptions {
     fn default() -> Self {
-        ImageOptions {
-            width: 1024,
-            height: 1024,
-            transparent: false,
-            fit: true,
-            floor: FloorStyle::Shadow,
-            depth_shading: true,
-        }
+        ImageOptions { width: 1024, height: 1024, transparent: false, fit: true, floor: FloorStyle::None }
     }
 }
 
@@ -43,17 +35,12 @@ pub fn render_pose(skel: &Skeleton, pose: &Pose, camera: &Camera, opts: &ImageOp
     let view = View::new(camera);
     let style = Style {
         floor: opts.floor,
-        depth_shading: opts.depth_shading,
-        highlight: None,
-        line_width: if opts.fit { 0.0062 } else { 0.0042 },
+        line_width: if opts.fit { 0.0050 } else { 0.0036 },
         transparent: opts.transparent,
+        ..Style::default()
     };
-    let list = draw_body(&body, &view, &style);
-    let frame = if opts.fit {
-        Frame2::fit(&list, 0.0, 0.0, w as f32, h as f32, 0.07)
-    } else {
-        Frame2::camera(0.0, 0.0, w as f32, h as f32)
-    };
+    let framing = if opts.fit { Framing::Fit { margin: 0.07 } } else { Framing::Camera };
+    let (list, frame) = draw_body(&body, &view, &style, framing, [0.0, 0.0, w as f32, h as f32], 1.0);
     raster::draw_list(&mut pm, &list, &frame, h as f32);
     Ok(pm)
 }
@@ -73,7 +60,9 @@ pub struct SheetOptions {
     /// Cell size in pixels (square cells).
     pub cell: u32,
     pub transparent: bool,
+    /// Numbered badge in the top-left corner of every cell.
     pub numbers: bool,
+    /// Pose name under every figure.
     pub names: bool,
     pub floor: FloorStyle,
     pub title: Option<String>,
@@ -86,12 +75,15 @@ impl Default for SheetOptions {
             cell: 360,
             transparent: false,
             numbers: true,
-            names: true,
-            floor: FloorStyle::Shadow,
+            names: false,
+            floor: FloorStyle::None,
             title: None,
         }
     }
 }
+
+/// Badge colour of the cell numbers.
+pub const BADGE: crate::render::Rgba = [226, 96, 122, 255];
 
 /// Render a numbered grid of poses (like a printed pose reference sheet).
 pub fn render_contact_sheet(skel: &Skeleton, items: &[SheetItem], opts: &SheetOptions) -> Result<Pixmap, String> {
@@ -102,8 +94,8 @@ pub fn render_contact_sheet(skel: &Skeleton, items: &[SheetItem], opts: &SheetOp
     let rows = (items.len() as u32).div_ceil(cols);
     let cell = opts.cell.clamp(64, 2048) as f32;
     let title_h = if opts.title.is_some() { (cell * 0.16).round() } else { 0.0 };
-    let w = (cols as f32 * cell).round() as u32;
-    let h = (rows as f32 * cell + title_h).round() as u32;
+    let w = (cols as f32 * cell).round() as u32 + 1;
+    let h = (rows as f32 * cell + title_h).round() as u32 + 1;
     if (w as u64) * (h as u64) > 400_000_000 {
         return Err("contact sheet would be too large".into());
     }
@@ -119,20 +111,26 @@ pub fn render_contact_sheet(skel: &Skeleton, items: &[SheetItem], opts: &SheetOp
         let body = Body::new(skel, &item.pose);
         let cam = framing_camera(&body, item.yaw, item.pitch, true);
         let view = View::new(&cam);
-        let style = Style { floor: opts.floor, line_width: 0.0085, transparent: opts.transparent, ..Style::default() };
-        let list = draw_body(&body, &view, &style);
+        let style = Style { floor: opts.floor, line_width: 0.0100, transparent: opts.transparent, ..Style::default() };
         let label_h = if opts.names { cell * 0.1 } else { 0.0 };
-        let top = if opts.numbers { cell * 0.1 } else { 0.0 };
-        let frame = Frame2::fit(&list, cx, cy + top, cell, cell - top - label_h, 0.06);
+        let top = if opts.numbers { cell * 0.03 } else { 0.0 };
+        let rect = [cx, cy + top, cell, cell - top - label_h];
+        let (list, frame) = draw_body(&body, &view, &style, Framing::Fit { margin: 0.045 }, rect, 1.0);
         raster::draw_list(&mut pm, &list, &frame, cell);
         if opts.numbers {
+            let r = cell * 0.074;
+            let (bx, by) = (cx + cell * 0.03 + r, cy + cell * 0.03 + r);
+            raster::fill_circle(&mut pm, bx, by, r, BADGE);
+            let label = item.number.to_string();
+            let size = r * 1.25;
+            let tw = raster::text_width(&label, size);
             raster::text(
                 &mut pm,
-                &item.number.to_string(),
-                cx + cell * 0.045,
-                cy + cell * 0.1,
-                cell * 0.085,
-                ink,
+                &label,
+                bx - tw * 0.5 - size * 0.02,
+                by + size * 0.36,
+                size,
+                [255, 255, 255, 255],
                 true,
             );
         }
@@ -142,17 +140,15 @@ pub fn render_contact_sheet(skel: &Skeleton, items: &[SheetItem], opts: &SheetOp
             raster::text(&mut pm, &item.name, cx + (cell - tw) * 0.5, cy + cell - cell * 0.035, size, grey, false);
         }
     }
-    // Cell borders.
-    let line_c = [200, 200, 205, 255];
-    for c in 1..cols {
-        let x = c as f32 * cell;
+    // Thin grey cell borders.
+    let line_c = [196, 196, 200, 255];
+    for c in 0..=cols {
+        let x = c as f32 * cell + 0.5;
         raster::line(&mut pm, &[[x, title_h], [x, h as f32]], 1.0, line_c);
     }
-    for r in 0..rows {
-        let y = title_h + r as f32 * cell;
-        if r > 0 || title_h > 0.0 {
-            raster::line(&mut pm, &[[0.0, y], [w as f32, y]], 1.0, line_c);
-        }
+    for r in 0..=rows {
+        let y = title_h + r as f32 * cell + 0.5;
+        raster::line(&mut pm, &[[0.0, y], [w as f32, y]], 1.0, line_c);
     }
     Ok(pm)
 }
@@ -206,8 +202,8 @@ mod tests {
         assert_eq!(items.iter().map(|i| i.number).collect::<Vec<_>>(), vec![1, 5, 10]);
         let opts = SheetOptions { columns: 2, cell: 160, title: Some("Test".into()), ..SheetOptions::default() };
         let pm = render_contact_sheet(&skel, &items, &opts).unwrap();
-        assert_eq!(pm.width(), 320);
-        assert!(pm.height() > 320);
+        assert_eq!(pm.width(), 321);
+        assert!(pm.height() > 321);
         assert!(non_white(&pm) > 500);
         let path = std::env::temp_dir().join(format!("rps-sheet-{}.png", std::process::id()));
         save_png(&pm, &path).unwrap();

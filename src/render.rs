@@ -1,13 +1,14 @@
 //! Camera, projection and the backend-independent mannequin drawing list.
 //!
-//! The scene is turned into a list of flat 2D primitives (convex filled polygons
-//! with outlines and open polylines) sorted back-to-front. The same list is drawn
-//! on screen by egui and rasterised offscreen by tiny-skia for PNG export, so the
-//! exported images match the viewport exactly.
+//! The posed body is turned into line art by [`crate::lineart`]: visible contour
+//! polylines plus a per-pixel fill mask. Together with optional floor decoration
+//! this forms a [`DrawList`] that egui draws on screen and tiny-skia rasterises
+//! for PNG export, so the exported images match the viewport exactly.
 
 use serde::{Deserialize, Serialize};
 
-use crate::body::{Body, Part, Volume};
+use crate::body::{Body, Volume};
+use crate::lineart::{EMPTY, Scene};
 use crate::math::{Mat3, Vec3, v3};
 use crate::skeleton::Joint;
 
@@ -104,8 +105,8 @@ impl View {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FloorStyle {
-    None,
     #[default]
+    None,
     Shadow,
     Grid,
 }
@@ -113,24 +114,18 @@ pub enum FloorStyle {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Style {
     pub floor: FloorStyle,
-    /// Lighter fill for nearer parts.
-    pub depth_shading: bool,
     pub highlight: Option<Joint>,
     /// Outline width as a fraction of the frame height.
     pub line_width: f32,
     /// Paper is transparent (affects the shadow colour only).
     pub transparent: bool,
+    /// Produce the white body fill mask (needed over grids / transparent paper).
+    pub fill: bool,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style {
-            floor: FloorStyle::Shadow,
-            depth_shading: true,
-            highlight: None,
-            line_width: 0.0042,
-            transparent: false,
-        }
+        Style { floor: FloorStyle::None, highlight: None, line_width: 0.0036, transparent: false, fill: true }
     }
 }
 
@@ -152,8 +147,57 @@ pub struct Prim {
     pub joint: Option<Joint>,
 }
 
+/// Per-pixel body coverage over a view-space rectangle (white paper fill + picking).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mask {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+    pub w: usize,
+    pub h: usize,
+    /// Joint index per pixel, [`MASK_EMPTY`] for background.
+    pub joints: Vec<u8>,
+    pub highlight: Option<Joint>,
+}
+
+pub const MASK_EMPTY: u8 = 255;
+pub const HIGHLIGHT_FILL: Rgba = [255, 228, 196, 255];
+
+impl Mask {
+    pub fn joint_at(&self, x: f32, y: f32) -> Option<Joint> {
+        let px = ((x - self.min[0]) / (self.max[0] - self.min[0]) * self.w as f32).floor();
+        let py = ((self.max[1] - y) / (self.max[1] - self.min[1]) * self.h as f32).floor();
+        if px < 0.0 || py < 0.0 || px >= self.w as f32 || py >= self.h as f32 {
+            return None;
+        }
+        let j = self.joints[py as usize * self.w + px as usize];
+        Joint::ALL.get(j as usize).copied()
+    }
+
+    /// RGBA colour of every pixel (unpremultiplied): white body, tinted highlight.
+    pub fn rgba(&self) -> Vec<u8> {
+        let hl = self.highlight.map(|j| j.index() as u8);
+        let mut out = Vec::with_capacity(self.joints.len() * 4);
+        for &j in &self.joints {
+            let c = if j == MASK_EMPTY {
+                [0, 0, 0, 0]
+            } else if Some(j) == hl {
+                HIGHLIGHT_FILL
+            } else {
+                PAPER
+            };
+            out.extend_from_slice(&c);
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawList {
+    /// Floor decoration, drawn below the body.
+    pub under: Vec<Prim>,
+    /// Body fill.
+    pub mask: Option<Mask>,
+    /// Body lines, drawn on top.
     pub prims: Vec<Prim>,
     /// Bounds of the figure (excluding floor decoration) in view units.
     pub min: [f32; 2],
@@ -165,34 +209,10 @@ impl DrawList {
         self.prims.is_empty()
     }
 
-    /// Topmost body part under a view-space point.
+    /// Body part under a view-space point.
     pub fn pick(&self, x: f32, y: f32) -> Option<Joint> {
-        self.prims.iter().rev().filter(|p| p.closed && p.fill.is_some()).find_map(|p| {
-            let j = p.joint?;
-            point_in_convex(&p.pts, x, y).then_some(j)
-        })
+        self.mask.as_ref()?.joint_at(x, y)
     }
-}
-
-fn point_in_convex(pts: &[[f32; 2]], x: f32, y: f32) -> bool {
-    if pts.len() < 3 {
-        return false;
-    }
-    let mut sign = 0.0f32;
-    for i in 0..pts.len() {
-        let a = pts[i];
-        let b = pts[(i + 1) % pts.len()];
-        let c = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
-        if c.abs() < 1e-12 {
-            continue;
-        }
-        if sign == 0.0 {
-            sign = c.signum();
-        } else if c.signum() != sign {
-            return false;
-        }
-    }
-    true
 }
 
 /// Convex hull (Andrew's monotone chain), counter-clockwise.
@@ -222,13 +242,6 @@ pub fn convex_hull(mut pts: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
     upper.pop();
     lower.extend(upper);
     lower
-}
-
-fn circle_pts(out: &mut Vec<[f32; 2]>, cx: f32, cy: f32, r: f32, n: usize) {
-    for i in 0..n {
-        let a = i as f32 / n as f32 * std::f32::consts::TAU;
-        out.push([cx + r * a.cos(), cy + r * a.sin()]);
-    }
 }
 
 /// Outline of a projected ellipsoid (weak perspective at its centre).
@@ -264,133 +277,111 @@ fn ellipse_outline(view: &View, center: Vec3, axes: &Mat3, n: usize) -> (Vec<[f3
     (pts, c)
 }
 
-fn capsule_outline(view: &View, a: Vec3, ra: f32, b: Vec3, rb: f32) -> (Vec<[f32; 2]>, f32) {
-    let pa = view.project(a);
-    let pb = view.project(b);
-    let mut pts = Vec::with_capacity(56);
-    circle_pts(&mut pts, pa.x, pa.y, ra * pa.scale, 28);
-    circle_pts(&mut pts, pb.x, pb.y, rb * pb.scale, 28);
-    (convex_hull(pts), 0.5 * (pa.depth + pb.depth))
+/// How the figure is placed in the output rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Framing {
+    /// The camera's own framing (view y in [-1, 1] fills the height).
+    Camera,
+    /// Fit the figure into the rectangle with a relative margin.
+    Fit { margin: f32 },
 }
 
-/// Visible part of a curve on the head surface (local unit-sphere points `u`).
-fn head_curve(view: &View, center: Vec3, axes: &Mat3, us: impl Iterator<Item = Vec3>) -> Vec<Vec<[f32; 2]>> {
-    // For axes = R * S, the surface normal at local u is R * (u / s).
-    let sx = axes.x.length().max(1e-6);
-    let sy = axes.y.length().max(1e-6);
-    let sz = axes.z.length().max(1e-6);
-    let mut runs = Vec::new();
-    let mut cur: Vec<[f32; 2]> = Vec::new();
-    for u in us {
-        let p = center + axes.mul_vec(u);
-        let n = axes.x * (u.x / (sx * sx)) + axes.y * (u.y / (sy * sy)) + axes.z * (u.z / (sz * sz));
-        if n.dot(view.to_viewer(p)) > 0.02 {
-            let q = view.project(p);
-            cur.push([q.x, q.y]);
-        } else if cur.len() > 1 {
-            runs.push(std::mem::take(&mut cur));
-        } else {
-            cur.clear();
-        }
-    }
-    if cur.len() > 1 {
-        runs.push(cur);
-    }
-    runs
-}
+/// Build the drawing list for a posed body shown in the output rectangle
+/// `(x, y, w, h)` (output units, e.g. screen points or pixels). `res` is the number
+/// of raster pixels per output unit used for visibility and the fill mask.
+/// Returns the list and the frame that maps it into the rectangle.
+pub fn draw_body(
+    body: &Body,
+    view: &View,
+    style: &Style,
+    framing: Framing,
+    rect: [f32; 4],
+    res: f32,
+) -> (DrawList, Frame2) {
+    let [x, y, w, h] = rect;
+    let scene = Scene::new(body, view);
+    let frame = match framing {
+        Framing::Camera => Frame2::camera(x, y, w, h),
+        Framing::Fit { margin } => Frame2::fit_bounds(scene.min, scene.max, x, y, w, h, margin),
+    };
+    let a = frame.from_px([x, y + h]);
+    let b = frame.from_px([x + w, y]);
+    let (pw, ph) = (((w * res).round() as usize).clamp(1, 8192), ((h * res).round() as usize).clamp(1, 8192));
+    let buf = scene.buffers(a, b, pw, ph);
 
-fn shade(fill: u8, t: f32) -> Rgba {
-    let v = (fill as f32 * (1.0 - t) + 206.0 * t).round() as u8;
-    [v, v, v, 255]
-}
-
-struct Group {
-    depth: f32,
-    prims: Vec<Prim>,
-}
-
-/// Build the drawing list for a posed body.
-pub fn draw_body(body: &Body, view: &View, style: &Style) -> DrawList {
-    let mut list = DrawList::default();
+    let mut list = DrawList { min: scene.min, max: scene.max, ..DrawList::default() };
     let lw = style.line_width;
     let s = (body.fk.tip(Joint::Head).y - body.min_y()).max(0.5) / 1.7;
-
-    // Floor decoration.
     match style.floor {
         FloorStyle::Grid => {
-            let pelvis = body.fk.pos(Joint::Pelvis);
-            let (cx, cz) = ((pelvis.x / 0.25).round() * 0.25, (pelvis.z / 0.25).round() * 0.25);
-            let n = 8;
-            let ext = n as f32 * 0.25;
-            for i in -n..=n {
-                let o = i as f32 * 0.25;
-                let col: Rgba = if i == 0 { [175, 180, 190, 255] } else { [214, 217, 222, 255] };
-                for (a, b) in [
-                    (v3(cx - ext, 0.0, cz + o), v3(cx + ext, 0.0, cz + o)),
-                    (v3(cx + o, 0.0, cz - ext), v3(cx + o, 0.0, cz + ext)),
-                ] {
-                    let mut pts = Vec::new();
-                    for k in 0..=16 {
-                        let p = view.project(a.lerp(b, k as f32 / 16.0));
-                        if p.depth > 0.1 {
-                            pts.push([p.x, p.y]);
-                        }
-                    }
-                    if pts.len() > 1 {
-                        list.prims.push(Prim {
-                            pts,
-                            fill: None,
-                            stroke: Some(Stroke { width: lw * 0.45, color: col }),
-                            closed: false,
-                            joint: None,
-                        });
-                    }
-                }
-            }
-            push_shadows(&mut list, body, view, style, s);
+            push_grid(&mut list.under, body, view, lw);
         }
-        FloorStyle::Shadow => push_shadows(&mut list, body, view, style, s),
+        FloorStyle::Shadow => push_shadows(&mut list.under, body, view, style, s),
         FloorStyle::None => {}
     }
-
-    // Body parts, painter's algorithm.
-    let mut groups: Vec<Group> = body.parts.iter().map(|p| part_group(p, view, style)).collect();
-    // The neck emerges from inside the rib cage: always paint it before the chest.
-    let find = |j: Joint| body.parts.iter().position(|p| p.joint == j);
-    if let (Some(n), Some(c)) = (find(Joint::Neck), find(Joint::Chest)) {
-        groups[n].depth = groups[n].depth.max(groups[c].depth + 1e-3);
+    if style.fill {
+        let joints = buf
+            .part
+            .iter()
+            .map(|&p| if p == EMPTY { MASK_EMPTY } else { body.parts[p as usize].joint.index() as u8 })
+            .collect();
+        list.mask = Some(Mask { min: a, max: b, w: pw, h: ph, joints, highlight: style.highlight });
     }
-    let (dmin, dmax) =
-        groups.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), g| (a.min(g.depth), b.max(g.depth)));
-    if style.depth_shading && dmax > dmin {
-        for g in &mut groups {
-            let t = ((g.depth - dmin) / (dmax - dmin)).clamp(0.0, 1.0);
-            if let Some(p) = g.prims.first_mut()
-                && let Some(f) = p.fill
-                && p.joint != style.highlight
-            {
-                p.fill = Some(shade(f[0], t * 0.85));
-            }
-        }
+    for line in scene.lines(&buf) {
+        let joint = body.parts[line.part].joint;
+        let hl = style.highlight == Some(joint);
+        let width = if line.guide { lw * 0.7 } else { lw } * if hl { 1.25 } else { 1.0 };
+        let color = if hl {
+            ACCENT
+        } else if line.guide {
+            [60, 60, 64, 255]
+        } else {
+            INK
+        };
+        list.prims.push(Prim {
+            pts: line.pts,
+            fill: None,
+            stroke: Some(Stroke { width, color }),
+            closed: false,
+            joint: Some(joint),
+        });
     }
-    groups.sort_by(|a, b| b.depth.total_cmp(&a.depth));
-    let mut min = [f32::INFINITY; 2];
-    let mut max = [f32::NEG_INFINITY; 2];
-    for g in groups {
-        for p in g.prims {
-            for q in &p.pts {
-                min = [min[0].min(q[0]), min[1].min(q[1])];
-                max = [max[0].max(q[0]), max[1].max(q[1])];
-            }
-            list.prims.push(p);
-        }
-    }
-    list.min = min;
-    list.max = max;
-    list
+    (list, frame)
 }
 
-fn push_shadows(list: &mut DrawList, body: &Body, view: &View, style: &Style, s: f32) {
+fn push_grid(out: &mut Vec<Prim>, body: &Body, view: &View, lw: f32) {
+    let pelvis = body.fk.pos(Joint::Pelvis);
+    let (cx, cz) = ((pelvis.x / 0.25).round() * 0.25, (pelvis.z / 0.25).round() * 0.25);
+    let n = 8;
+    let ext = n as f32 * 0.25;
+    for i in -n..=n {
+        let o = i as f32 * 0.25;
+        let col: Rgba = if i == 0 { [178, 183, 192, 255] } else { [216, 219, 224, 255] };
+        for (a, b) in [
+            (v3(cx - ext, 0.0, cz + o), v3(cx + ext, 0.0, cz + o)),
+            (v3(cx + o, 0.0, cz - ext), v3(cx + o, 0.0, cz + ext)),
+        ] {
+            let mut pts = Vec::new();
+            for k in 0..=16 {
+                let p = view.project(a.lerp(b, k as f32 / 16.0));
+                if p.depth > 0.1 {
+                    pts.push([p.x, p.y]);
+                }
+            }
+            if pts.len() > 1 {
+                out.push(Prim {
+                    pts,
+                    fill: None,
+                    stroke: Some(Stroke { width: lw * 0.45, color: col }),
+                    closed: false,
+                    joint: None,
+                });
+            }
+        }
+    }
+}
+
+fn push_shadows(list: &mut Vec<Prim>, body: &Body, view: &View, style: &Style, s: f32) {
     let reach = 0.22 * s;
     for part in &body.parts {
         let h = part.volume.min_y();
@@ -399,7 +390,7 @@ fn push_shadows(list: &mut DrawList, body: &Body, view: &View, style: &Style, s:
         }
         let k = (1.0 - (h / reach).max(0.0)).powf(1.5);
         let (center, axes) = match part.volume {
-            Volume::Capsule { a, ra, b, rb } => {
+            Volume::Capsule { a, ra, b, rb, .. } => {
                 let fa = v3(a.x, 0.0, a.z);
                 let fb = v3(b.x, 0.0, b.z);
                 let along = fb - fa;
@@ -409,7 +400,7 @@ fn push_shadows(list: &mut DrawList, body: &Body, view: &View, style: &Style, s:
                 let r = ra.max(rb) * 1.1;
                 (fa.lerp(fb, 0.5), Mat3::from_cols(dir * (len * 0.5 + r), Vec3::Y * 0.001, side * r))
             }
-            Volume::Ellipsoid { center, axes } | Volume::Blob { a: (center, axes), .. } => {
+            Volume::Ellipsoid { center, axes } => {
                 let flat = |v: Vec3| v3(v.x, 0.0, v.z) * 1.1;
                 (v3(center.x, 0.0, center.z), Mat3::from_cols(flat(axes.x), flat(axes.y), flat(axes.z)))
             }
@@ -422,63 +413,7 @@ fn push_shadows(list: &mut DrawList, body: &Body, view: &View, style: &Style, s:
         }
         let (pts, _) = ellipse_outline(view, center, &axes, 32);
         let alpha = (k * if style.transparent { 60.0 } else { 46.0 }) as u8;
-        list.prims.push(Prim { pts, fill: Some([60, 64, 72, alpha]), stroke: None, closed: true, joint: None });
-    }
-}
-
-fn part_group(part: &Part, view: &View, style: &Style) -> Group {
-    let hl = style.highlight == Some(part.joint);
-    let stroke =
-        Some(Stroke { width: style.line_width * if hl { 1.7 } else { 1.0 }, color: if hl { ACCENT } else { INK } });
-    let fill = Some(if hl { [255, 226, 190, 255] } else { PAPER });
-    match part.volume {
-        Volume::Capsule { a, ra, b, rb } => {
-            let (pts, depth) = capsule_outline(view, a, ra, b, rb);
-            Group { depth, prims: vec![Prim { pts, fill, stroke, closed: true, joint: Some(part.joint) }] }
-        }
-        Volume::Blob { a, b } => {
-            let (mut pa, ca) = ellipse_outline(view, a.0, &a.1, 48);
-            let (pb, _) = ellipse_outline(view, b.0, &b.1, 40);
-            pa.extend(pb);
-            Group {
-                depth: ca.depth,
-                prims: vec![Prim { pts: convex_hull(pa), fill, stroke, closed: true, joint: Some(part.joint) }],
-            }
-        }
-        Volume::Ellipsoid { center, axes } => {
-            let (pts, c) = ellipse_outline(view, center, &axes, 48);
-            let mut prims = vec![Prim { pts, fill, stroke, closed: true, joint: Some(part.joint) }];
-            // Pull the head forward in the sort so it reliably covers the neck.
-            let mut depth = c.depth;
-            if part.is_head {
-                depth -= 0.05 * axes.y.length() / 0.112;
-                let guide = Stroke { width: style.line_width * 0.7, color: if hl { ACCENT } else { INK } };
-                // Vertical centre line (front half, chin to crown).
-                let meridian = (0..=40).map(|i| {
-                    let t = (-80.0 + 160.0 * i as f32 / 40.0).to_radians();
-                    v3(0.0, t.sin(), t.cos())
-                });
-                // Horizontal eye line slightly below the middle.
-                let lat: f32 = -0.12;
-                let eye_line = (0..=40).map(move |i| {
-                    let t = (-95.0 + 190.0 * i as f32 / 40.0).to_radians();
-                    v3(lat.cos() * t.sin(), lat.sin(), lat.cos() * t.cos())
-                });
-                for run in head_curve(view, center, &axes, meridian)
-                    .into_iter()
-                    .chain(head_curve(view, center, &axes, eye_line))
-                {
-                    prims.push(Prim {
-                        pts: run,
-                        fill: None,
-                        stroke: Some(guide),
-                        closed: false,
-                        joint: Some(part.joint),
-                    });
-                }
-            }
-            Group { depth, prims }
-        }
+        list.push(Prim { pts, fill: Some([60, 64, 72, alpha]), stroke: None, closed: true, joint: None });
     }
 }
 
@@ -498,6 +433,12 @@ impl Frame2 {
 
     /// Fit the figure bounds into the rectangle with a relative margin.
     pub fn fit(list: &DrawList, x: f32, y: f32, w: f32, h: f32, margin: f32) -> Frame2 {
+        Frame2::fit_bounds(list.min, list.max, x, y, w, h, margin)
+    }
+
+    /// Fit view-space bounds into the rectangle with a relative margin.
+    pub fn fit_bounds(min: [f32; 2], max: [f32; 2], x: f32, y: f32, w: f32, h: f32, margin: f32) -> Frame2 {
+        let list = DrawList { min, max, ..DrawList::default() };
         let bw = (list.max[0] - list.min[0]).max(1e-3);
         let bh = (list.max[1] - list.min[1]).max(1e-3);
         if !bw.is_finite() || !bh.is_finite() {
@@ -563,21 +504,23 @@ mod tests {
     fn hull_of_square_points() {
         let h = convex_hull(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]]);
         assert_eq!(h.len(), 4);
-        assert!(point_in_convex(&h, 0.5, 0.5));
-        assert!(!point_in_convex(&h, 1.5, 0.5));
+        assert!(!h.contains(&[0.5, 0.5]));
     }
 
     #[test]
-    fn draw_list_has_all_parts_and_picks() {
+    fn draw_list_has_lines_fill_and_picks() {
         let skel = Skeleton::new(Proportions::default());
         let body = Body::new(&skel, &Pose::rest(&skel));
         let cam = Camera { yaw: 0.0, pitch: 0.0, ..Camera::default() };
         let view = View::new(&cam);
-        let list = draw_body(&body, &view, &Style::default());
-        let filled = list.prims.iter().filter(|p| p.joint.is_some() && p.fill.is_some()).count();
-        assert_eq!(filled, body.parts.len());
+        let (list, frame) = draw_body(&body, &view, &Style::default(), Framing::Camera, [0.0, 0.0, 400.0, 400.0], 1.0);
+        assert!(list.prims.len() > 5);
         assert!(list.prims.iter().all(|p| p.pts.iter().all(|q| q[0].is_finite() && q[1].is_finite())));
-        let head = view.project(body.fk.pos(Joint::Head) + v3(0.0, 0.1, 0.0));
+        let mask = list.mask.as_ref().unwrap();
+        assert_eq!((mask.w, mask.h), (400, 400));
+        let head = view.project(body.fk.pos(Joint::Head) + v3(0.0, 0.12, 0.0));
         assert_eq!(list.pick(head.x, head.y), Some(Joint::Head));
+        let px = frame.to_px([head.x, head.y]);
+        assert!(px[0] > 0.0 && px[0] < 400.0 && px[1] > 0.0 && px[1] < 400.0);
     }
 }

@@ -4,7 +4,7 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-use crate::render::{DrawList, Frame2, Rgba};
+use crate::render::{DrawList, Frame2, Mask, Rgba};
 
 fn paint(c: Rgba) -> Paint<'static> {
     let mut p = Paint::default();
@@ -16,7 +16,30 @@ fn paint(c: Rgba) -> Paint<'static> {
 /// Rasterise a drawing list into `pixmap` using `frame` (view units -> pixels).
 /// `frame_h` is the height of the frame the relative line widths refer to.
 pub fn draw_list(pixmap: &mut Pixmap, list: &DrawList, frame: &Frame2, frame_h: f32) {
-    for prim in &list.prims {
+    draw_prims(pixmap, &list.under, frame, frame_h);
+    if let Some(mask) = &list.mask {
+        draw_mask(pixmap, mask, frame);
+    }
+    draw_prims(pixmap, &list.prims, frame, frame_h);
+}
+
+/// Composite the body fill mask (its view rectangle mapped through `frame`).
+fn draw_mask(pixmap: &mut Pixmap, mask: &Mask, frame: &Frame2) {
+    let Some(mut img) = Pixmap::new(mask.w as u32, mask.h as u32) else { return };
+    let rgba = mask.rgba();
+    for (dst, src) in img.pixels_mut().iter_mut().zip(rgba.as_chunks::<4>().0) {
+        *dst = tiny_skia::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+    let a = frame.to_px([mask.min[0], mask.max[1]]);
+    let b = frame.to_px([mask.max[0], mask.min[1]]);
+    let sx = (b[0] - a[0]) / mask.w as f32;
+    let sy = (b[1] - a[1]) / mask.h as f32;
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    pixmap.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_row(sx, 0.0, 0.0, sy, a[0], a[1]), None);
+}
+
+fn draw_prims(pixmap: &mut Pixmap, prims: &[crate::render::Prim], frame: &Frame2, frame_h: f32) {
+    for prim in prims {
         if prim.pts.len() < 2 {
             continue;
         }
@@ -45,6 +68,13 @@ pub fn draw_list(pixmap: &mut Pixmap, list: &DrawList, frame: &Frame2, frame_h: 
             };
             pixmap.stroke_path(&path, &paint(s.color), &stroke, Transform::identity(), None);
         }
+    }
+}
+
+/// Fill a circle.
+pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    if let Some(path) = PathBuilder::from_circle(cx, cy, r) {
+        pixmap.fill_path(&path, &paint(c), FillRule::Winding, Transform::identity(), None);
     }
 }
 

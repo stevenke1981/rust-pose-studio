@@ -4,7 +4,7 @@
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke};
 use rust_pose_studio::body::{Body, handle_point};
 use rust_pose_studio::posing::{aim_joint, ik_limb};
-use rust_pose_studio::render::{Frame2, Style, View, draw_body};
+use rust_pose_studio::render::{Frame2, Framing, Style, View, draw_body};
 use rust_pose_studio::skeleton::{Joint, forward};
 
 use super::{Drag, PoseApp, paint, theme};
@@ -42,9 +42,10 @@ impl PoseApp {
                 .copied()
         };
 
-        let style0 =
-            Style { floor: self.floor, depth_shading: self.depth_shading, highlight: None, ..Style::default() };
-        let pick_list = draw_body(&body, &view, &style0);
+        // Picking uses the previous frame's drawing (same rectangle and camera framing).
+        let empty = rust_pose_studio::render::DrawList::default();
+        let cache = self.view_cache.take();
+        let pick_list = cache.as_ref().map(|c| &c.list).unwrap_or(&empty);
         self.hovered = None;
         if self.drag.is_none()
             && let Some(p) = pointer
@@ -119,12 +120,31 @@ impl PoseApp {
             }
         }
 
+        self.view_cache = cache;
+
         // --- drawing (fresh geometry after the edits above) ---
         let body = Body::new(&self.skel, &self.pose);
         let view = View::new(&self.camera);
-        let style = Style { highlight: self.selected.or(self.hovered.filter(|_| false)), ..style0 };
-        let list = draw_body(&body, &view, &style);
-        paint::draw(&painter, &list, &frame, rect.height());
+        let ppp = ui.ctx().pixels_per_point();
+        let key = super::ViewKey {
+            pose: self.pose.clone(),
+            props: self.props,
+            camera: self.camera,
+            rect: [rect.left(), rect.top(), rect.width(), rect.height()],
+            ppp,
+            floor: self.floor,
+            highlight: self.selected,
+        };
+        if self.view_cache.as_ref().is_none_or(|c| c.key != key) {
+            let style = Style { floor: self.floor, highlight: self.selected, ..Style::default() };
+            let (list, _) = draw_body(&body, &view, &style, Framing::Camera, key.rect, ppp);
+            let mut tex = self.view_cache.take().and_then(|c| c.tex);
+            paint::mask_texture(ui.ctx(), &list, &mut tex);
+            self.view_cache = Some(super::ViewCache { key, list, tex });
+        }
+        if let Some(c) = &self.view_cache {
+            paint::draw(&painter, &c.list, &frame, rect.height(), c.tex.as_ref());
+        }
 
         if self.show_handles {
             let fk = forward(&self.skel, &self.pose);

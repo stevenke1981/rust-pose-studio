@@ -199,7 +199,7 @@ impl BodyType {
 pub struct Proportions {
     /// Standing height in metres.
     pub height: f32,
-    /// Head size multiplier (1.0 = about 1/7.5 of the height).
+    /// Head size multiplier (1.0 = about 1/7 of the height).
     pub head_size: f32,
     pub shoulder_width: f32,
     pub hip_width: f32,
@@ -252,20 +252,20 @@ impl Skeleton {
         set(&mut offset, &mut bone, Pelvis, Vec3::ZERO, v3(0.0, 0.10, 0.0));
         set(&mut offset, &mut bone, Waist, v3(0.0, 0.10, 0.0), v3(0.0, 0.12, 0.0));
         set(&mut offset, &mut bone, Chest, v3(0.0, 0.12, 0.0), v3(0.0, 0.25, 0.0));
-        set(&mut offset, &mut bone, Neck, v3(0.0, 0.25, -0.005), v3(0.0, 0.075, 0.0));
-        set(&mut offset, &mut bone, Head, v3(0.0, 0.075, 0.0), v3(0.0, 0.215 * hs, 0.0));
+        set(&mut offset, &mut bone, Neck, v3(0.0, 0.25, -0.012), v3(0.0, 0.07, 0.0));
+        set(&mut offset, &mut bone, Head, v3(0.0, 0.07, 0.0), v3(0.0, 0.24 * hs, 0.0));
         for (sign, ua, fa, ha, th, sh, ft) in [
             (1.0, UpperArmL, ForearmL, HandL, ThighL, ShinL, FootL),
             (-1.0, UpperArmR, ForearmR, HandR, ThighR, ShinR, FootR),
         ] {
-            set(&mut offset, &mut bone, ua, v3(sign * 0.185 * sw, 0.215, -0.01), v3(0.0, -0.29, 0.0));
-            set(&mut offset, &mut bone, fa, v3(0.0, -0.29, 0.0), v3(0.0, -0.25, 0.0));
-            set(&mut offset, &mut bone, ha, v3(0.0, -0.25, 0.0), v3(0.0, -0.18, 0.0));
-            set(&mut offset, &mut bone, th, v3(sign * 0.09 * hw, -0.06, 0.0), v3(0.0, -0.42, 0.0));
-            set(&mut offset, &mut bone, sh, v3(0.0, -0.42, 0.0), v3(0.0, -0.41, 0.0));
+            set(&mut offset, &mut bone, ua, v3(sign * 0.168 * sw, 0.212, -0.018), v3(0.0, -0.28, 0.0));
+            set(&mut offset, &mut bone, fa, v3(0.0, -0.28, 0.0), v3(0.0, -0.24, 0.0));
+            set(&mut offset, &mut bone, ha, v3(0.0, -0.24, 0.0), v3(0.0, -0.155, 0.0));
+            set(&mut offset, &mut bone, th, v3(sign * 0.088 * hw, -0.065, 0.0), v3(0.0, -0.43, 0.0));
+            set(&mut offset, &mut bone, sh, v3(0.0, -0.43, 0.0), v3(0.0, -0.41, 0.0));
             set(&mut offset, &mut bone, ft, v3(0.0, -0.41, 0.0), v3(0.0, -0.055, 0.155));
         }
-        Skeleton { props: p, offset, bone, standing_pelvis_height: 0.96 * s }
+        Skeleton { props: p, offset, bone, standing_pelvis_height: 0.98 * s }
     }
 
     /// Bone length of a joint.
@@ -396,9 +396,9 @@ mod tests {
         let fk = forward(&skel, &Pose::rest(&skel));
         // Ankles a little above the floor, head top near the standing height.
         let ankle = fk.pos(Joint::FootL);
-        assert!((ankle.y - 0.07).abs() < 1e-4, "{ankle:?}");
+        assert!((ankle.y - 0.075).abs() < 1e-4, "{ankle:?}");
         let top = fk.tip(Joint::Head);
-        assert!((top.y - 1.71).abs() < 0.03, "{top:?}");
+        assert!((top.y - 1.76).abs() < 0.03, "{top:?}");
         for j in Joint::ALL {
             let a = fk.pos(j);
             let b = fk.pos(j.mirror());

@@ -20,7 +20,7 @@ use rust_pose_studio::export::{self, ImageOptions, SheetItem, SheetOptions};
 use rust_pose_studio::pose_io::PoseFile;
 use rust_pose_studio::posing::random_pose;
 use rust_pose_studio::presets::{Preset, presets};
-use rust_pose_studio::render::{Camera, DrawList, FloorStyle, Style, View, draw_body, framing_camera};
+use rust_pose_studio::render::{Camera, DrawList, FloorStyle, Framing, Style, View, draw_body, framing_camera};
 use rust_pose_studio::skeleton::{Joint, Pose, Proportions, Skeleton};
 
 const UNDO_LIMIT: usize = 200;
@@ -67,11 +67,11 @@ impl Default for ExportSettings {
             transparent: false,
             fit: true,
             match_view: false,
-            floor: FloorStyle::Shadow,
+            floor: FloorStyle::None,
             sheet_cols: 5,
             sheet_cell: 400,
             sheet_numbers: true,
-            sheet_names: true,
+            sheet_names: false,
             sheet_title: String::new(),
             sheet_current_angle: false,
             sheet_add_current: false,
@@ -105,7 +105,7 @@ pub struct PoseApp {
     snap: bool,
     show_handles: bool,
     floor: FloorStyle,
-    depth_shading: bool,
+    view_cache: Option<ViewCache>,
     export: ExportSettings,
     jobs: Vec<Job>,
     status: Option<(bool, String)>,
@@ -128,7 +128,7 @@ impl PoseApp {
             skel,
             pose: pose.clone(),
             pose_name: presets[0].name.to_string(),
-            camera: Camera::default(),
+            camera: Camera { yaw: presets[0].yaw, pitch: presets[0].pitch.max(8.0), ..Camera::default() },
             selected: None,
             hovered: None,
             drag: None,
@@ -144,7 +144,7 @@ impl PoseApp {
             snap: true,
             show_handles: true,
             floor: FloorStyle::Grid,
-            depth_shading: true,
+            view_cache: None,
             export: ExportSettings::default(),
             jobs: Vec::new(),
             status: None,
@@ -367,14 +367,7 @@ impl PoseApp {
         } else {
             (e.size, e.size)
         };
-        let opts = ImageOptions {
-            width: w,
-            height: h,
-            transparent: e.transparent,
-            fit: e.fit,
-            floor: e.floor,
-            depth_shading: self.depth_shading,
-        };
+        let opts = ImageOptions { width: w, height: h, transparent: e.transparent, fit: e.fit, floor: e.floor };
         let (skel, pose, camera) = (self.skel.clone(), self.pose.clone(), self.camera);
         self.spawn_job(ctx, format!("Exporting {}", path.display()), move || {
             let pm = export::render_pose(&skel, &pose, &camera, &opts)?;
@@ -421,7 +414,7 @@ impl PoseApp {
             transparent: e.transparent,
             numbers: e.sheet_numbers,
             names: e.sheet_names,
-            floor: if e.floor == FloorStyle::Grid { FloorStyle::Shadow } else { e.floor },
+            floor: if e.floor == FloorStyle::Grid { FloorStyle::None } else { e.floor },
             title: (!e.sheet_title.trim().is_empty()).then(|| e.sheet_title.trim().to_string()),
         };
         let skel = self.skel.clone();
@@ -510,7 +503,6 @@ impl PoseApp {
                 }
                 ui.checkbox(&mut self.camera.perspective, "Perspective");
                 ui.checkbox(&mut self.show_handles, "Show joint handles");
-                ui.checkbox(&mut self.depth_shading, "Depth shading");
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("Controls…").clicked() {
@@ -567,7 +559,7 @@ impl PoseApp {
                         inner.height() - 12.0,
                         0.04,
                     );
-                    paint::draw(&painter, list, &frame, cell * 1.6);
+                    paint::draw(&painter, list, &frame, cell * 1.6, None);
                     painter.text(
                         rect.left_top() + egui::vec2(5.0, 3.0),
                         egui::Align2::LEFT_TOP,
@@ -736,14 +728,33 @@ fn sanitize(name: &str) -> String {
     if s.is_empty() { "pose".into() } else { s }
 }
 
+/// Everything the viewport drawing depends on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewKey {
+    pose: rust_pose_studio::skeleton::Pose,
+    props: Proportions,
+    camera: Camera,
+    rect: [f32; 4],
+    ppp: f32,
+    floor: FloorStyle,
+    highlight: Option<rust_pose_studio::skeleton::Joint>,
+}
+
+/// The last viewport drawing and its fill texture.
+pub(crate) struct ViewCache {
+    key: ViewKey,
+    list: DrawList,
+    tex: Option<egui::TextureHandle>,
+}
+
 fn make_thumbs(skel: &Skeleton, presets: &[Preset]) -> Vec<DrawList> {
     presets
         .iter()
         .map(|p| {
             let body = Body::new(skel, &p.pose);
             let cam = framing_camera(&body, p.yaw, p.pitch, true);
-            let style = Style { line_width: 0.0035, ..Style::default() };
-            draw_body(&body, &View::new(&cam), &style)
+            let style = Style { line_width: 0.0042, fill: false, ..Style::default() };
+            draw_body(&body, &View::new(&cam), &style, Framing::Fit { margin: 0.04 }, [0.0, 0.0, 180.0, 180.0], 1.0).0
         })
         .collect()
 }

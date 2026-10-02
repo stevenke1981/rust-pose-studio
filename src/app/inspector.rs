@@ -126,7 +126,6 @@ impl PoseApp {
                 ui.selectable_value(&mut self.floor, FloorStyle::Shadow, "Shadow");
                 ui.selectable_value(&mut self.floor, FloorStyle::None, "None");
             });
-            ui.checkbox(&mut self.depth_shading, "Depth shading");
             ui.checkbox(&mut self.show_handles, "Joint handles");
         });
         egui::CollapsingHeader::new(RichText::new("Export").strong()).default_open(true).show(ui, |ui| {

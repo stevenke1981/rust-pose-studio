@@ -15,9 +15,9 @@ rust-pose-studio — posable drawing mannequin
 USAGE:
   rust-pose-studio                         start the GUI
   rust-pose-studio --contact-sheet OUT.png [--cell PX] [--cols N] [--yaw DEG] [--pitch DEG]
-                   [--transparent] [--no-names] [--title TEXT] [--only 1,5,9]
+                   [--transparent] [--names] [--no-numbers] [--title TEXT] [--only 1,5,9]
   rust-pose-studio --render POSE OUT.png   POSE = preset number (1-25) or a pose .json file
-                   [--size PX] [--yaw DEG] [--pitch DEG] [--transparent] [--grid]
+                   [--size PX] [--yaw DEG] [--pitch DEG] [--transparent] [--grid | --shadow]
                    [--turnaround]   four views (front, left, back, right) side by side
   rust-pose-studio --list                  list the built-in presets
   rust-pose-studio --floor-report          show which body parts touch the floor per preset
@@ -90,7 +90,8 @@ fn contact_sheet(args: &[String]) -> Result<(), String> {
         columns: value(args, "--cols")?.unwrap_or(5),
         cell: value(args, "--cell")?.unwrap_or(360),
         transparent: args.iter().any(|a| a == "--transparent"),
-        names: !args.iter().any(|a| a == "--no-names"),
+        names: args.iter().any(|a| a == "--names"),
+        numbers: !args.iter().any(|a| a == "--no-numbers"),
         title: value(args, "--title")?,
         ..SheetOptions::default()
     };
@@ -127,7 +128,7 @@ fn render(args: &[String]) -> Result<(), String> {
             .enumerate()
             .map(|(i, (n, y))| SheetItem { number: i + 1, name: n.to_string(), pose: pose.clone(), yaw: *y, pitch })
             .collect();
-        let opts = SheetOptions { columns: 5, cell: size / 2, numbers: false, ..SheetOptions::default() };
+        let opts = SheetOptions { columns: 5, cell: size / 2, numbers: false, names: true, ..SheetOptions::default() };
         let pm = render_contact_sheet(&skel, &items, &opts)?;
         save_png(&pm, &out)?;
         println!("wrote {} ({}x{})", out.display(), pm.width(), pm.height());
@@ -139,7 +140,13 @@ fn render(args: &[String]) -> Result<(), String> {
         width: size,
         height: size,
         transparent: args.iter().any(|a| a == "--transparent"),
-        floor: if args.iter().any(|a| a == "--grid") { FloorStyle::Grid } else { FloorStyle::Shadow },
+        floor: if args.iter().any(|a| a == "--grid") {
+            FloorStyle::Grid
+        } else if args.iter().any(|a| a == "--shadow") {
+            FloorStyle::Shadow
+        } else {
+            FloorStyle::None
+        },
         ..ImageOptions::default()
     };
     let pm = render_pose(&skel, &pose, &cam, &opts)?;

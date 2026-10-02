@@ -13,16 +13,22 @@ hands and feet), and export clean line-art reference images or a numbered contac
 
 - **3D posable mannequin** – 17-joint skeleton (pelvis root → waist → chest → neck → head,
   shoulders/upper arms/forearms/hands, thighs/shins/feet). Joint rotations are Euler angles
-  evaluated with forward kinematics; the body is built from capsules and ellipsoids and drawn
-  as mannequin-style line art (white paper, black outlines, depth-sorted filled segments,
-  depth shading, oval head with face-direction guide lines, soft contact shadows).
+  evaluated with forward kinematics. The female mannequin body (slim waist, broad hips, long
+  legs, ~6.5-head proportions, mitten hands, simple feet, egg-shaped head) is built from
+  smoothly blended tapered volumes and drawn as **pure line art**: white fill, one clean black
+  contour around the union silhouette, and interior lines only where it matters – where a part
+  passes in front of another (thigh over calf, arm over torso) and where two body parts meet in
+  a fold (hip crease, buttock fold, under the bust, behind a bent knee or elbow). No gray fills,
+  no shading, no visible joint balls; the head carries a center line and an eye line that follow
+  its orientation. Floor shadows / grid are optional (off by default in exports).
 - **Camera** – orbit, pan and zoom; perspective or orthographic projection; front / ¾ /
   side / back / high-angle / top presets; one-click framing.
-- **25 built-in presets** shown as a live-rendered thumbnail gallery – seiza, kneeling looking
-  back, side-lying propped on an elbow, lying on the stomach with legs up, all fours, sitting
-  hugging knees, side-saddle, crouching on toes, cat stretch, lying on the back with a knee
-  raised, cross-legged, curled up, one-knee kneel, crawling, supine twist and more. Every
-  preset is grounded on the floor (knees, shins, feet, hands or body actually touch it).
+- **25 built-in floor poses** shown as a live-rendered thumbnail gallery – sitting back on the
+  heels, kneeling on all fours, sitting between the heels, crawling, lying on the stomach with
+  the chin in the hands, side-lying propped on a forearm, side-saddle sitting, wide and frog
+  kneels, child's pose, mermaid sit, hugging the knees, lying on the back and more. Each preset
+  stores its own default camera angle (used for the thumbnail, the contact sheet and when it is
+  loaded). Every preset is grounded on the floor.
 - **Manual posing**
   - click a joint handle or body part to select it;
   - drag blue handles to rotate a joint (FK), drag the green diamonds at wrists and ankles to
@@ -36,13 +42,14 @@ hands and feet), and export clean line-art reference images or a numbered contac
 - **Save / load poses** as small human-readable JSON files.
 - **Export** (rendered by a CPU rasteriser built on `tiny-skia`, so it does not depend on the GPU
   and matches the on-screen style): PNG of the current view at 512–4096 px, white or
-  transparent background, shadow / grid / no floor; and a **contact sheet** of all presets
-  (or a Ctrl+click selection) with numbers and names. Exports run on a background thread.
+  transparent background, optional shadow / grid floor; and a **contact sheet** of all presets
+  (or a Ctrl+click selection): 5×5 grid, thin gray cell borders, a pink rounded number badge in
+  each cell's corner, optional pose names. Exports run on a background thread.
 - **Headless CLI** for scripting/batch export (see below).
 
 ![Contact sheet of all 25 presets](docs/contact-sheet.png)
 
-Turnaround export (`--turnaround`) of preset 13:
+Turnaround export (`--turnaround`) of preset 7:
 
 ![Turnaround](docs/turnaround.png)
 
@@ -68,9 +75,10 @@ Turnaround export (`--turnaround`) of preset 13:
 ```text
 rust-pose-studio                         start the GUI
 rust-pose-studio --contact-sheet OUT.png [--cell PX] [--cols N] [--yaw DEG] [--pitch DEG]
-                 [--transparent] [--no-names] [--title TEXT] [--only 1,5,9]
+                 [--transparent] [--names] [--no-numbers] [--title TEXT] [--only 1,5,9]
 rust-pose-studio --render POSE OUT.png   POSE = preset number (1-25) or a pose .json file
-                 [--size PX] [--yaw DEG] [--pitch DEG] [--transparent] [--grid] [--turnaround]
+                 [--size PX] [--yaw DEG] [--pitch DEG] [--transparent] [--grid | --shadow]
+                 [--turnaround]
 rust-pose-studio --list                  list the built-in presets
 rust-pose-studio --floor-report          show which body parts touch the floor per preset
 rust-pose-studio --help | --version
@@ -82,7 +90,7 @@ rust-pose-studio --help | --version
 {
   "format": "rust-pose-studio/pose",
   "version": 1,
-  "name": "Seiza (kneeling on heels)",
+  "name": "Sitting on heels, arching back",
   "root": [0.0, 0.52, 0.0],
   "joints": { "pelvis": [0, 0, 0], "thigh_l": [-90, 0, 0], "shin_l": [150, 0, 0] },
   "proportions": { "height": 1.7, "head_size": 1.0, "shoulder_width": 1.0, "hip_width": 1.0, "body_type": "average" },
@@ -117,7 +125,7 @@ cargo clippy --all-targets
 ```
 
 Windows installer (NSIS 3): `cargo build --release --target x86_64-pc-windows-msvc`, then
-`makensis /DVERSION=0.1.0 installer\windows\rust-pose-studio.nsi` (writes to `dist\`).
+`makensis /DVERSION=0.2.0 installer\windows\rust-pose-studio.nsi` (writes to `dist\`).
 Tagging `v*` builds the installer and the portable exe in GitHub Actions and attaches them to
 the release.
 
@@ -127,10 +135,11 @@ the release.
 | --- | --- |
 | `src/math.rs` | small Vec3 / Mat3 / Euler helpers |
 | `src/skeleton.rs` | joints, proportions, poses, forward kinematics, mirroring |
-| `src/body.rs` | capsule/ellipsoid body volumes, floor snapping, drag-handle positions |
+| `src/body.rs` | tapered body volumes (round cones / ellipsoids), floor snapping, drag handles |
 | `src/ik.rs`, `src/posing.rs` | two-bone IK solver, limb aiming, random poses |
 | `src/presets.rs` | the 25 built-in poses (authored with a small pose-builder DSL) |
-| `src/render.rs` | camera, projection, depth-sorted 2D draw list shared by GUI and export |
+| `src/lineart.rs` | line-art renderer: tessellation, software z-buffer, contour & crease extraction |
+| `src/render.rs` | camera, projection, 2D draw list (fill mask + lines) shared by GUI and export |
 | `src/raster.rs`, `src/export.rs` | tiny-skia rasteriser, PNG and contact-sheet export |
 | `src/pose_io.rs` | pose JSON |
 | `src/cli.rs` | headless command line |
@@ -150,20 +159,23 @@ traced; all images are rendered by this program. UI font: Ubuntu Light (bundled 
 
 ## 繁體中文說明
 
-**Rust Pose Studio** 是一個用 Rust + egui 撰寫的輕量桌面「繪畫用木頭人／人體模型」工具，
+**Rust Pose Studio** 是一個用 Rust + egui 撰寫的輕量桌面「繪畫用人體模型」工具，
 適合人物速寫與姿勢練習：選擇 25 個內建的地面姿勢、從任意角度旋轉觀看、拖曳關節調整姿勢，
 並匯出乾淨的線稿參考圖或帶編號的姿勢總表（contact sheet）。
 
 ### 功能
 
 - **3D 可動人偶**：17 個關節的骨架（骨盆為根節點 → 腰 → 胸 → 頸 → 頭，肩／上臂／前臂／手、
-  大腿／小腿／腳），以尤拉角 + 正向運動學（FK）計算；身體由膠囊體與橢球組成，
-  以人偶線稿風格繪製（白底、黑色輪廓、依深度排序的填色部件、深度明暗、
-  帶有臉部方向十字線的橢圓頭部、地面接觸陰影）。
+  大腿／小腿／腳），以尤拉角 + 正向運動學（FK）計算。女性人體模型（細腰、寬臀、長腿、
+  約 6.5 頭身、連指手套式的手、簡化的腳、蛋形頭部）由平滑銜接的錐形體積組成，
+  並以**純線稿**繪製：白色填色、沿整體輪廓的單一乾淨黑線，只在部位重疊（大腿壓小腿、
+  手臂在軀幹前）與身體折線（鼠蹊、臀線、胸部下緣、彎曲的膝窩／肘窩）處畫內部線條；
+  沒有灰色填色、沒有明暗、沒有關節球；頭部有隨方向轉動的中心線與眼睛線。
+  地面陰影／格線為選用（匯出預設關閉）。
 - **攝影機**：環繞、平移、縮放；透視／正交投影；正面、3/4、側面、背面、俯視等預設視角。
-- **25 個內建姿勢**（縮圖即時渲染）：正坐、跪坐回頭、側躺手肘撐地、趴姿抬腿、四肢著地、
-  抱膝坐、側坐、蹲踞、貓式伸展、仰躺單膝立起、盤腿、蜷縮側躺、單膝跪地、爬行、仰躺扭轉等。
-  每個姿勢的膝蓋、小腿、腳、手或身體都確實接觸地面。
+- **25 個內建地面姿勢**（縮圖即時渲染）：跪坐後仰、四肢跪地、鴨子坐、爬行、趴著托腮、
+  側躺前臂撐地、側坐、大開膝跪坐、青蛙跪、嬰兒式、美人魚坐、抱膝坐、仰躺等。
+  每個姿勢都記錄了自己的預設攝影機角度（用於縮圖、總表與載入時），且都確實貼地。
 - **手動調整**：點選關節；拖曳藍色控制點旋轉關節（FK）；拖曳手腕／腳踝的綠色菱形以
   **雙骨 IK** 擺放手腳；拖曳紫色骨盆點移動整個人偶；選取關節的 X/Y/Z 旋轉滑桿
   （手肘、膝蓋為鉸鏈關節）；重設關節、複製到另一側、整體左右鏡像、隨機姿勢、
@@ -171,7 +183,8 @@ traced; all images are rendered by this program. UI font: Ubuntu Light (bundled 
 - **身體比例**：身高、頭部大小、肩寬、臀寬、體型（纖細／標準／豐滿）。
 - **姿勢存檔／讀取**：可讀的 JSON 格式。
 - **匯出**：使用 CPU 光柵化（tiny-skia），不依賴 GPU，且與畫面風格一致；可匯出目前視角
-  的 PNG（512–4096 px、白底或透明背景），以及所有（或以 Ctrl+點選挑選的）姿勢的編號總表。
+  的 PNG（512–4096 px、白底或透明背景），以及所有（或以 Ctrl+點選挑選的）姿勢的總表
+  （5×5 格、細灰框線、左上角粉紅圓形編號，姿勢名稱可選）。
   匯出在背景執行緒進行，不會卡住介面。
 - **命令列模式**：可批次輸出圖片（見上方 Command line）。
 

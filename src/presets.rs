@@ -26,6 +26,11 @@ fn d(x: f32, y: f32, z: f32) -> Vec3 {
     v3(x, y, z).normalized()
 }
 
+/// `v` turned by `deg` degrees about the vertical axis (+Z towards +X).
+fn ry(deg: f32, v: Vec3) -> Vec3 {
+    Mat3::rot_y(deg.to_radians()).mul_vec(v)
+}
+
 /// World-space pose builder.
 #[derive(Clone)]
 struct B<'a> {
@@ -123,487 +128,508 @@ impl<'a> B<'a> {
 
 use Joint::*;
 
+const SIDES: [(f32, Joint, Joint, Joint); 2] = [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)];
+const ARMS: [(f32, Joint, Joint, Joint); 2] = [(1.0, UpperArmL, ForearmL, HandL), (-1.0, UpperArmR, ForearmR, HandR)];
+
+impl B<'_> {
+    /// Lowest point of the whole figure.
+    fn floor(&self) -> f32 {
+        Body::new(self.s, &self.pose).min_y()
+    }
+    /// Folded leg: the thigh aims at `knee` and the shin at `ankle`, both given
+    /// relative to the root's floor point (reference metres).
+    fn kneel(&mut self, th: Joint, sh: Joint, knee: Vec3, ankle: Vec3) -> &mut Self {
+        let _ = sh;
+        let base = v3(self.pose.root.x, 0.0, self.pose.root.z);
+        let hip = self.pos(th);
+        let du = (base + knee * self.k - hip).normalized();
+        let knee_at = hip + du * (self.s.length(th));
+        let dl = (base + ankle * self.k - knee_at).normalized_or(-du);
+        self.limb(th, du, dl)
+    }
+    /// Place a wrist `y` above the current floor at an (x, z) offset from the shoulder.
+    fn hand_floor(&mut self, fa: Joint, dx: f32, dz: f32, pole: Vec3) -> &mut Self {
+        let sh = self.pos(fa.parent().unwrap());
+        let y = self.floor() + 0.03 * self.k;
+        self.ik(fa, v3(sh.x + dx * self.k, y, sh.z + dz * self.k), pole)
+    }
+    /// Distance between the shoulder and the floor point the hand should reach.
+    fn reach_err(&self, fa: Joint, dx: f32, dz: f32, len: f32) -> f32 {
+        let sh = self.pos(fa.parent().unwrap());
+        let t = v3(sh.x + dx * self.k, self.floor() + 0.03 * self.k, sh.z + dz * self.k);
+        ((t - sh).length() - len * self.k).abs()
+    }
+}
+
 /// All built-in presets for the given skeleton.
 pub fn presets(s: &Skeleton) -> Vec<Preset> {
     let mut v = Vec::with_capacity(25);
     let mut add = |name: &'static str, yaw: f32, pitch: f32, pose: Pose| v.push(Preset { name, yaw, pitch, pose });
 
-    // 1. Seiza: kneeling, sitting on the heels, hands on the thighs.
+    // 1. Sitting back on the heels, back arched, looking up (seen from behind).
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.28, 0.0).spine(d(0.0, 1.0, 0.08), d(0.0, 1.0, 0.0), d(0.0, 1.0, -0.06), Vec3::Z);
-        b.head(d(0.0, 1.0, 0.06), d(0.0, -0.08, 1.0));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let knee = b.off(Vec3::ZERO, sx * 0.11, 0.05, 0.39);
-            let hip = b.pos(th);
-            b.ik(sh, b.off(Vec3::ZERO, sx * 0.055, 0.065, -0.02), knee - hip);
+        b.root(0.0, 0.30, 0.0).spine(d(0.0, 1.0, 0.9), d(0.0, 1.0, 0.5), d(0.0, 1.0, 0.12), Vec3::Z);
+        b.head(d(0.0, 0.85, -0.55), d(0.0, 0.55, 0.85));
+        for (sx, th, sh, ft) in SIDES {
+            b.kneel(th, sh, v3(sx * 0.17, 0.05, 0.42), v3(sx * 0.13, 0.065, -0.10));
             b.foot(ft, d(-sx * 0.15, -0.3, -1.0), d(0.0, -1.0, -0.3));
         }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            b.ik(fa, b.off(Vec3::ZERO, sx * 0.14, 0.24, 0.14), d(sx * 0.4, 0.0, -1.0));
-            b.hand(ha, d(-sx * 0.1, -0.4, 1.0), d(0.0, -1.0, 0.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.02, 0.16, d(0.0, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.1, -0.2, 1.0), -Vec3::Y);
         }
-        add("Seiza (kneeling on heels)", 35.0, 10.0, b.done());
+        add("Sitting on heels, arching back", -122.0, 15.0, b.done());
     }
 
-    // 2. Kneeling, twisting to look back over the shoulder, one hand on the floor.
+    // 2. Kneeling on all fours, torso raised, looking ahead (seen from behind).
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.30, 0.0).orient(Pelvis, d(0.08, 1.0, 0.05), Vec3::Z);
-        b.orient(Waist, d(0.12, 1.0, 0.0), d(0.3, 0.0, 1.0)).orient(Chest, d(0.2, 1.0, -0.05), d(0.8, 0.0, 0.6));
-        b.head(d(0.05, 1.0, 0.0), d(0.9, -0.05, -0.35));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let knee = b.off(Vec3::ZERO, sx * 0.12, 0.05, 0.38);
-            let hip = b.pos(th);
-            b.ik(sh, b.off(Vec3::ZERO, sx * 0.06, 0.065, -0.02), knee - hip);
-            b.foot(ft, d(-sx * 0.15, -0.3, -1.0), d(0.0, -1.0, -0.3));
-        }
-        let sh = b.pos(UpperArmL);
-        b.ik(ForearmL, v3(sh.x + 0.14 * b.k, 0.03 * b.k, sh.z - 0.12 * b.k), d(0.0, 0.0, -1.0));
-        b.hand(HandL, d(0.4, 0.0, -1.0), d(0.0, -1.0, 0.0));
-        b.ik(ForearmR, b.off(Vec3::ZERO, 0.10, 0.22, 0.24), d(-0.6, -0.3, -0.6));
-        b.hand(HandR, d(0.4, -0.4, 1.0), d(0.0, -1.0, 0.0));
-        add("Kneeling, looking back", 140.0, 10.0, b.done());
-    }
-
-    // 3. Lying on the right side, propped on the elbow, head resting on the hand.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.165, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), Vec3::Z);
-        // Raise the chest until the right elbow (upper arm hanging almost straight
-        // down from the shoulder) rests on the floor.
-        let k = b.k;
-        let upper_dir = d(0.07, -1.0, 0.33);
-        b.best(10.0, 85.0, 150, |b, a| {
-            let a = a.to_radians();
-            b.orient(Waist, d(-1.0, 0.35 * a.sin(), 0.0), Vec3::Z).orient(Chest, d(-a.cos(), a.sin(), 0.0), Vec3::Z);
-            (b.pos(UpperArmR).y + upper_dir.y * 0.29 * k - 0.036 * k).abs()
+        b.root(0.0, 0.45, 0.0);
+        b.best(0.0, 0.9, 90, |b, t| {
+            b.spine(d(0.0, t * 0.8, 1.0), d(0.0, t * 0.9, 1.0), d(0.0, t, 1.0), -Vec3::Y);
+            for (sx, th, _, ft) in SIDES {
+                b.limb(th, d(sx * 0.15, -1.0, 0.42), d(-sx * 0.03, 0.18, -1.0));
+                b.foot(ft, d(0.0, -1.0, 0.3), d(0.0, 0.3, 1.0));
+            }
+            b.reach_err(ForearmL, 0.03, 0.16, 0.50)
         });
-        b.head(d(-0.45, 1.0, 0.0), d(0.1, -0.1, 1.0));
-        let sh = b.pos(UpperArmR);
-        let elbow = sh + upper_dir * (0.29 * k);
-        let cheek = b.at(Head, -0.07, 0.0, 0.03);
-        b.limb(UpperArmR, upper_dir, cheek - elbow);
-        b.hand(HandR, d(-0.2, 1.0, 0.0), d(1.0, 0.0, 0.2));
-        let hip_r = b.pos(ThighR);
-        let hip_l = b.pos(ThighL);
-        b.ik(ShinR, b.off(hip_r, 0.80, -0.02, 0.12), d(0.0, 0.0, 1.0));
-        b.ik(ShinL, b.off(hip_l, 0.62, -0.15, 0.32), d(0.0, 0.0, 1.0));
-        b.foot(FootR, d(0.25, 0.0, 1.0), d(-1.0, 0.0, 0.0)).foot(FootL, d(0.35, -0.2, 1.0), d(-1.0, 0.0, 0.0));
-        b.ik(ForearmL, b.off(hip_l, 0.12, 0.04, 0.10), d(0.0, 0.3, -1.0));
-        b.hand(HandL, d(1.0, -0.2, 0.2), d(0.0, -1.0, 0.0));
-        add("Side-lying, propped on elbow", 10.0, 14.0, b.done());
+        b.head(d(0.0, 1.0, 0.6), d(0.0, -0.15, 1.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.03, 0.16, d(0.0, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.15, 0.0, 1.0), -Vec3::Y);
+        }
+        add("Kneeling on all fours, torso raised", -155.0, 12.0, b.done());
     }
 
-    // 4. Lying on the stomach on the elbows, chin in hands, lower legs up.
+    // 3. Sitting back on the heels, leaning forward onto the hands in front of the knees.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.30, 0.0);
+        b.best(0.0, 1.2, 120, |b, t| {
+            b.spine(d(0.0, 1.0, 0.4 + t * 0.4), d(0.0, 1.0, 0.1 + t * 0.6), d(0.0, 1.0, t * 0.7), Vec3::Z);
+            for (sx, th, sh, ft) in SIDES {
+                b.kneel(th, sh, v3(sx * 0.12, 0.05, 0.42), v3(sx * 0.16, 0.065, -0.08));
+                b.foot(ft, d(sx * 0.3, -0.3, -1.0), d(0.0, -1.0, -0.3));
+            }
+            b.reach_err(ForearmL, -0.07, 0.30, 0.53) + 0.01 * t
+        });
+        b.head(d(0.0, 1.0, 0.1), d(0.1, -0.2, 1.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, -sx * 0.07, 0.30, d(sx * 0.3, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.15, -0.1, 1.0), -Vec3::Y);
+        }
+        add("Sitting on heels, hands in front of knees", 45.0, 10.0, b.done());
+    }
+
+    // 4. Crawling on hands and knees, head lowered, one foot raised.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.34, 0.0).spine(d(0.0, 0.0, 1.0), d(0.0, 0.08, 1.0), d(0.0, 0.02, 1.0), -Vec3::Y);
+        b.head(d(0.0, 0.15, 1.0), d(0.0, -1.0, 0.3));
+        b.limb(ThighL, d(0.1, -0.77, -0.64), d(0.0, -0.05, -1.0));
+        b.limb(ThighR, d(-0.1, -0.8, -0.55), d(0.0, 0.55, -0.83));
+        b.foot(FootL, d(0.0, -0.15, -1.0), -Vec3::Y).foot(FootR, d(0.0, 0.7, -0.6), d(0.0, -0.6, -0.7));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.08, 0.18, d(sx * 0.8, 0.0, -0.6));
+            b.hand(ha, d(-sx * 0.15, 0.0, 1.0), -Vec3::Y);
+        }
+        add("Crawling, head lowered", -32.0, 10.0, b.done());
+    }
+
+    // 5. Lying on the stomach on the elbows, chin in the hands, lower legs up.
     {
         let mut b = B::new(s);
         b.root(0.0, 0.10, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), -Vec3::Y);
         b.orient(Waist, d(-1.0, 0.32, 0.0), -Vec3::Y).orient(Chest, d(-0.8, 0.6, 0.0), -Vec3::Y);
-        b.head(d(-0.25, 1.0, 0.0), d(-1.0, -0.15, 0.0));
+        b.head(d(-0.25, 1.0, 0.0), d(-1.0, -0.1, 0.0));
         for (sz, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let chin = b.at(Head, sz * 0.05, -0.0, 0.07);
+            let chin = b.at(Head, sz * 0.05, -0.02, 0.07);
             b.ik(fa, chin, d(0.0, -1.0, sz * 0.3));
             b.hand(ha, d(0.2, 1.0, -sz * 0.2), d(-1.0, 0.0, 0.0));
         }
-        b.limb(ThighL, d(1.0, -0.1, 0.06), d(0.35, 1.0, -0.12)).limb(ThighR, d(1.0, -0.1, -0.06), d(0.15, 1.0, 0.22));
-        b.foot(FootL, d(0.2, 1.0, -0.1), d(-1.0, 0.1, 0.0)).foot(FootR, d(0.1, 1.0, 0.2), d(-1.0, 0.1, 0.0));
-        add("Lying on stomach, legs up", 25.0, 12.0, b.done());
+        b.limb(ThighL, d(1.0, -0.1, 0.05), d(-0.5, 1.0, -0.2)).limb(ThighR, d(1.0, -0.1, -0.05), d(-0.6, 1.0, 0.18));
+        b.foot(FootL, d(-0.2, 1.0, -0.2), d(1.0, 0.3, 0.0)).foot(FootR, d(-0.3, 1.0, 0.2), d(1.0, 0.3, 0.0));
+        add("Lying on stomach, chin in hands", -158.0, 8.0, b.done());
     }
 
-    // 5. All fours (hands and knees).
+    // 6. Lying on the right side, propped on the forearm, top hand on the thigh.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.47, 0.0).spine(d(0.0, 0.12, 1.0), d(0.0, 0.2, 1.0), d(0.0, 0.25, 1.0), -Vec3::Y);
-        b.head(d(0.0, 0.7, 1.0), d(0.0, -1.0, 0.6));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let hip = b.pos(th);
-            b.ik(sh, v3(hip.x + sx * 0.01 * b.k, 0.055 * b.k, hip.z - 0.41 * b.k), d(0.0, -1.0, 1.0));
-            b.foot(ft, d(0.0, -0.2, -1.0), d(0.0, -1.0, 0.2));
-        }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let sh = b.pos(fa.parent().unwrap());
-            b.ik(fa, v3(sh.x + sx * 0.02 * b.k, 0.028 * b.k, sh.z + 0.02 * b.k), d(0.0, 0.0, -1.0));
-            b.hand(ha, d(-sx * 0.1, -0.12, 1.0), d(0.0, -1.0, 0.0));
-        }
-        add("All fours", 70.0, 12.0, b.done());
+        b.root(0.0, 0.165, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), Vec3::Z);
+        let k = b.k;
+        let upper_dir = d(0.1, -1.0, 0.15);
+        b.best(10.0, 85.0, 150, |b, a| {
+            let a = a.to_radians();
+            b.orient(Waist, d(-1.0, 0.8 * a.sin(), 0.0), Vec3::Z).orient(Chest, d(-a.cos(), a.sin(), 0.0), Vec3::Z);
+            (b.pos(UpperArmR).y + upper_dir.y * b.s.length(UpperArmR) - 0.045 * k).abs()
+        });
+        b.head(d(-0.1, 1.0, 0.0), d(0.1, -0.1, 1.0));
+        b.limb(UpperArmR, upper_dir, d(0.65, -0.02, 1.0));
+        b.hand(HandR, d(0.65, 0.0, 1.0), -Vec3::Y);
+        b.limb(ThighR, d(0.7, -0.02, 0.7), d(0.6, -0.02, -0.8));
+        b.limb(ThighL, d(0.75, -0.12, 0.8), d(0.7, -0.06, -0.6));
+        b.foot(FootR, d(0.25, 0.0, 1.0), d(-1.0, 0.0, 0.0)).foot(FootL, d(0.3, -0.1, 1.0), d(-1.0, 0.0, 0.0));
+        let knee = b.pos(ShinL);
+        b.ik(ForearmL, b.off(knee, -0.10, 0.06, 0.03), d(0.0, 0.3, -1.0));
+        b.hand(HandL, d(1.0, -0.2, 0.1), d(0.0, -1.0, 0.0));
+        add("Side-lying, propped on forearm", 12.0, 24.0, b.done());
     }
 
-    // 6. Sitting with knees up, hugging the knees.
+    // 7. Side-saddle sitting, legs folded to the right, hand on the knee.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.3), d(0.0, 1.0, 0.1), d(0.0, 1.0, 0.35), Vec3::Z);
-        b.head(d(0.0, 1.0, 0.15), d(0.0, -0.2, 1.0));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let _ = th;
-            b.ik(sh, b.off(Vec3::ZERO, sx * 0.12, 0.075, 0.45), d(0.0, 1.0, 0.3));
-            b.foot(ft, d(0.0, 0.0, 1.0), Vec3::Y);
-        }
-        b.ik(ForearmL, b.off(Vec3::ZERO, -0.03, 0.33, 0.40), d(1.0, 0.0, -0.2));
-        b.hand(HandL, d(-1.0, 0.0, 0.0), d(0.0, 0.0, -1.0));
-        b.ik(ForearmR, b.off(Vec3::ZERO, 0.03, 0.30, 0.41), d(-1.0, 0.0, -0.2));
-        b.hand(HandR, d(1.0, 0.0, 0.0), d(0.0, 0.0, -1.0));
-        add("Sitting, hugging knees", 40.0, 10.0, b.done());
-    }
-
-    // 7. Side-saddle sitting: legs folded to the right, leaning on the left hand.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.06, 1.0, 0.0), d(0.18, 1.0, 0.0), d(0.12, 1.0, 0.0), d(0.15, 0.0, 1.0));
-        b.head(d(-0.08, 1.0, 0.0), d(-0.25, -0.05, 1.0));
-        // Thigh slope chosen so that the hip and the folded legs all rest on the floor.
+        b.root(0.0, 0.12, 0.0).spine(d(0.06, 1.0, 0.0), d(0.16, 1.0, 0.02), d(0.08, 1.0, 0.02), d(0.15, 0.0, 1.0));
+        b.head(d(-0.12, 1.0, 0.0), d(-0.2, -0.1, 1.0));
         b.best(-0.3, 0.3, 60, |b, t| {
-            b.limb(ThighL, d(0.2, t, 1.0), d(-1.0, -0.02, -0.3));
-            b.limb(ThighR, d(-0.35, t + 0.04, 0.9), d(-0.55, -0.02, -1.0));
+            b.limb(ThighL, d(0.1, t, 1.0), d(-1.0, -0.02, -0.25));
+            b.limb(ThighR, d(-0.4, t + 0.04, 0.9), d(-0.5, -0.02, -1.0));
             (b.min_y_of(&[Pelvis]) - b.min_y_of(&[ThighL, ShinL, ShinR, ThighR])).abs()
         });
         b.foot(FootL, d(-1.0, 0.0, -0.4), d(0.0, 0.3, -1.0)).foot(FootR, d(-0.6, 0.0, -1.0), d(0.0, 0.3, -1.0));
-        let sh = b.pos(UpperArmL);
-        b.ik(ForearmL, v3(sh.x + 0.22 * b.k, 0.03 * b.k, sh.z - 0.06 * b.k), d(0.0, 0.0, -1.0));
-        b.hand(HandL, d(0.6, -0.1, -0.4), d(0.0, -1.0, 0.0));
+        b.hand_floor(ForearmL, 0.22, -0.04, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(0.6, -0.1, -0.2), d(0.0, -1.0, 0.0));
         let knee = b.pos(ShinL);
-        b.ik(ForearmR, b.off(knee, -0.05, 0.10, -0.06), d(-1.0, -0.5, -0.2));
-        b.hand(HandR, d(0.6, -0.4, 0.5), d(0.0, -1.0, 0.0));
-        add("Side-saddle sitting", 20.0, 12.0, b.done());
+        b.ik(ForearmR, b.off(knee, -0.04, 0.09, -0.02), d(-1.0, -0.5, -0.2));
+        b.hand(HandR, d(0.3, -0.5, 0.6), d(0.0, -1.0, 0.0));
+        add("Side-saddle sitting, hand on knee", 20.0, 10.0, b.done());
     }
 
-    // 8. Deep crouch on the balls of the feet, forearms on the knees.
+    // 8. On all fours, hips high, looking ahead (seen from behind the side).
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.30, 0.0).spine(d(0.0, 1.0, 0.25), d(0.0, 1.0, 0.35), d(0.0, 1.0, 0.45), Vec3::Z);
-        b.head(d(0.0, 1.0, 0.1), d(0.0, -0.1, 1.0));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
+        b.root(0.0, 0.50, 0.0).spine(d(0.0, -0.05, 1.0), d(0.0, -0.12, 1.0), d(0.0, -0.05, 1.0), -Vec3::Y);
+        b.head(d(0.0, 1.0, 0.8), d(0.0, -0.2, 1.0));
+        for (sx, th, sh, ft) in SIDES {
             let hip = b.pos(th);
-            let knee = b.off(Vec3::ZERO, sx * 0.2, 0.47, 0.33);
-            b.ik(sh, b.off(Vec3::ZERO, sx * 0.15, 0.14, 0.09), knee - hip);
-            b.foot(ft, d(sx * 0.15, -0.55, 1.0), d(0.0, 1.0, 0.55));
+            b.ik(sh, v3(hip.x + sx * 0.02 * b.k, 0.06 * b.k, hip.z - 0.38 * b.k), d(0.0, -1.0, 1.0));
+            b.foot(ft, d(0.0, -0.25, -1.0), d(0.0, -1.0, 0.25));
         }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let knee = b.pos(if sx > 0.0 { ShinL } else { ShinR });
-            b.ik(fa, b.off(knee, -sx * 0.06, -0.06, 0.16), d(sx * 0.4, -0.2, -1.0));
-            b.hand(ha, d(0.0, -1.0, 0.25), d(-sx, 0.0, 0.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.03, 0.10, d(0.0, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.1, -0.1, 1.0), -Vec3::Y);
         }
-        add("Crouching on toes", 50.0, 8.0, b.done());
+        add("All fours, looking ahead", -138.0, 8.0, b.done());
     }
 
-    // 9. Cat stretch: knees under the hips, chest low, arms reaching forward.
+    // 9. Wide kneel sitting between the heels, arms straight down in front.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.47, 0.0).spine(d(0.0, -0.85, 1.0), d(0.0, -0.9, 1.0), d(0.0, -0.6, 1.0), -Vec3::Y);
-        b.head(d(0.0, 0.25, 1.0), d(0.0, -1.0, 0.25));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let hip = b.pos(th);
-            b.ik(sh, v3(hip.x + sx * 0.01 * b.k, 0.055 * b.k, hip.z - 0.43 * b.k), d(0.0, -1.0, 1.0));
+        b.root(0.0, 0.15, 0.0);
+        b.best(0.0, 0.8, 80, |b, t| {
+            b.spine(d(0.0, 1.0, 0.1 + t * 0.2), d(0.0, 1.0, 0.05 + t * 0.4), d(0.0, 1.0, t), Vec3::Z);
+            for (sx, th, sh, ft) in SIDES {
+                b.kneel(th, sh, v3(sx * 0.26, 0.05, 0.34), v3(sx * 0.20, 0.05, -0.08));
+                b.foot(ft, d(sx * 0.2, -0.2, -1.0), d(0.0, -1.0, 0.2));
+            }
+            b.reach_err(ForearmL, -0.10, 0.18, 0.51) + 0.02 * t
+        });
+        b.head(d(0.0, 1.0, 0.12), d(0.0, -0.35, 1.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, -sx * 0.10, 0.18, d(sx * 0.4, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.15, -0.1, 1.0), -Vec3::Y);
+        }
+        add("Wide kneel, hands between knees", 0.0, 6.0, b.done());
+    }
+
+    // 10. Sitting with one knee up, forearm on the knee, leaning on the other hand.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.15), d(0.08, 1.0, -0.05), d(0.05, 1.0, 0.0), d(-0.15, 0.0, 1.0));
+        b.head(d(-0.08, 1.0, 0.0), d(-0.3, -0.1, 1.0));
+        b.ik(ShinR, b.off(Vec3::ZERO, -0.14, 0.075, 0.42), d(-0.2, 1.0, 0.3));
+        b.foot(FootR, d(-0.1, 0.0, 1.0), Vec3::Y);
+        b.kneel(ThighL, ShinL, v3(0.36, 0.06, 0.30), v3(-0.10, 0.05, 0.34));
+        b.foot(FootL, d(-1.0, 0.0, 0.1), d(0.0, 0.3, 1.0));
+        let knee = b.pos(ShinR);
+        b.ik(ForearmR, b.off(knee, 0.06, -0.06, 0.10), d(-1.0, 0.4, 0.0));
+        b.hand(HandR, d(0.4, -1.0, 0.2), d(0.0, 0.0, -1.0));
+        b.hand_floor(ForearmL, 0.16, -0.16, d(0.0, 0.0, 1.0));
+        b.hand(HandL, d(0.5, 0.0, -0.6), -Vec3::Y);
+        add("Sitting, forearm on raised knee", 22.0, 10.0, b.done());
+    }
+
+    // 11. All fours, hips high, head low (seen from the front side).
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.52, 0.0).spine(d(0.0, -0.22, 1.0), d(0.0, -0.3, 1.0), d(0.0, -0.18, 1.0), -Vec3::Y);
+        b.head(d(0.0, -0.05, 1.0), d(0.0, -1.0, -0.05));
+        b.limb(ThighR, d(-0.05, -1.0, -0.05), d(0.0, -0.08, -1.0));
+        b.limb(ThighL, d(0.05, -1.0, 0.05), d(0.0, 0.55, -0.85));
+        b.foot(FootR, d(0.0, -0.15, -1.0), -Vec3::Y).foot(FootL, d(0.0, 0.5, -0.85), d(0.0, -0.85, -0.5));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.03, 0.12, d(0.0, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.2, 0.0, 1.0), -Vec3::Y);
+        }
+        add("All fours, head low", -50.0, 14.0, b.done());
+    }
+
+    // 12. Side-saddle sitting, one hand behind the head, leaning on the other.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.12, 0.0).spine(d(0.08, 1.0, 0.0), d(0.2, 1.0, 0.0), d(0.1, 1.0, -0.04), d(0.2, 0.0, 1.0));
+        b.head(d(-0.15, 1.0, 0.05), d(-0.15, -0.1, 1.0));
+        b.best(-0.3, 0.3, 60, |b, t| {
+            b.limb(ThighL, d(0.0, t, 1.0), d(-1.0, -0.02, -0.15));
+            b.limb(ThighR, d(-0.5, t + 0.04, 0.85), d(-0.3, -0.02, -1.0));
+            (b.min_y_of(&[Pelvis]) - b.min_y_of(&[ThighL, ShinL, ShinR, ThighR])).abs()
+        });
+        b.foot(FootL, d(-1.0, 0.0, -0.2), d(0.0, 0.3, -1.0)).foot(FootR, d(-0.4, 0.0, -1.0), d(0.0, 0.3, -1.0));
+        b.hand_floor(ForearmL, 0.24, -0.02, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(0.6, -0.1, -0.2), d(0.0, -1.0, 0.0));
+        let nape = b.at(Head, -0.02, 0.06, -0.10);
+        b.ik(ForearmR, nape, d(-0.6, 1.0, 0.1));
+        b.hand(HandR, d(0.6, 0.3, -0.4), d(0.0, 0.0, 1.0));
+        add("Side-saddle, hand behind head", 22.0, 10.0, b.done());
+    }
+
+    // 13. Lying on the stomach, chin in the hands, lower legs up, crossed.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.10, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), -Vec3::Y);
+        b.orient(Waist, d(-1.0, 0.25, 0.0), -Vec3::Y).orient(Chest, d(-0.85, 0.5, 0.0), -Vec3::Y);
+        b.head(d(-0.2, 1.0, 0.0), d(-1.0, -0.05, 0.1));
+        for (sz, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
+            let chin = b.at(Head, sz * 0.06, -0.04, 0.06);
+            b.ik(fa, chin, d(0.0, -1.0, sz * 0.5));
+            b.hand(ha, d(0.0, 1.0, -sz * 0.3), d(-1.0, 0.0, 0.0));
+        }
+        b.limb(ThighL, d(1.0, -0.08, 0.06), d(-0.08, 1.0, -0.22)).limb(
+            ThighR,
+            d(1.0, -0.08, -0.06),
+            d(-0.12, 1.0, 0.22),
+        );
+        b.foot(FootL, d(0.1, 1.0, -0.2), d(1.0, -0.1, 0.0)).foot(FootR, d(0.05, 1.0, 0.2), d(1.0, -0.1, 0.0));
+        add("Lying on stomach, feet crossed up", -142.0, 12.0, b.done());
+    }
+
+    // 14. Sitting on the heels with the knees turned aside, hand on the floor.
+    {
+        let mut b = B::new(s);
+        let a = -68.0;
+        b.root(0.0, 0.34, 0.0).orient(Pelvis, d(0.0, 1.0, 0.0), ry(a, Vec3::Z));
+        b.orient(Waist, d(0.08, 1.0, 0.0), ry(a * 0.5, Vec3::Z)).orient(Chest, d(0.04, 1.0, -0.03), ry(0.0, Vec3::Z));
+        b.head(d(-0.05, 1.0, 0.0), ry(-12.0, d(0.0, -0.12, 1.0)));
+        for (sx, th, sh, ft) in SIDES {
+            b.kneel(th, sh, ry(a, v3(sx * 0.11, 0.05, 0.38)), ry(a, v3(sx * 0.07 + 0.08, 0.065, -0.05)));
+            b.foot(ft, ry(a, d(0.0, -0.3, -1.0)), ry(a, d(0.0, -1.0, -0.3)));
+        }
+        b.hand_floor(ForearmL, 0.16, 0.0, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(0.5, 0.0, 0.5), -Vec3::Y);
+        let knee = b.pos(ShinR);
+        let hip = b.pos(ThighR);
+        b.ik(ForearmR, hip.lerp(knee, 0.65) + v3(0.0, 0.07 * b.k, 0.0), d(-1.0, -0.2, -0.5));
+        b.hand(HandR, ry(a, d(0.0, -0.3, 1.0)), -Vec3::Y);
+        add("Sitting on heels, knees turned aside", 25.0, 10.0, b.done());
+    }
+
+    // 15. Child's pose with the arms stretched forward (seen from behind, above).
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.40, 0.0);
+        b.spine(d(0.0, -0.3, 1.0), d(0.0, -0.45, 1.0), d(0.0, -0.3, 1.0), -Vec3::Y);
+        for (sx, th, _, ft) in SIDES {
+            b.limb(th, d(sx * 0.15, -1.0, 0.7), d(0.0, 0.0, -1.0));
             b.foot(ft, d(0.0, -0.2, -1.0), d(0.0, -1.0, 0.2));
         }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let sh = b.pos(fa.parent().unwrap());
-            b.ik(fa, v3(sh.x + sx * 0.04 * b.k, 0.026 * b.k, sh.z + 0.6 * b.k), d(0.0, 1.0, 0.0));
-            b.hand(ha, d(0.0, -0.1, 1.0), d(0.0, -1.0, 0.0));
+        b.head(d(0.0, -0.2, 1.0), d(0.0, -1.0, -0.2));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, sx * 0.04, 0.48, d(0.0, 1.0, 0.0));
+            b.hand(ha, d(0.0, 0.0, 1.0), -Vec3::Y);
         }
-        add("Cat stretch", 80.0, 12.0, b.done());
+        add("Child's pose, arms forward", -140.0, 32.0, b.done());
     }
 
-    // 10. Lying on the back, one knee raised, arms above the head.
+    // 16. Mermaid sitting, leaning forward onto both hands, head bowed.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.10, 0.0).spine(d(-1.0, 0.0, 0.0), d(-1.0, 0.0, 0.0), d(-1.0, 0.05, 0.0), Vec3::Y);
-        b.head(d(-1.0, 0.15, 0.0), d(0.15, 1.0, 0.25));
-        b.limb(ThighL, d(1.0, -0.06, -0.06), d(1.0, -0.02, -0.02));
-        let hip = b.pos(ThighR);
-        b.ik(ShinR, v3(hip.x + 0.48 * b.k, 0.075 * b.k, hip.z + 0.03 * b.k), d(0.0, 1.0, 0.0));
-        b.foot(FootL, d(0.2, 1.0, -0.15), d(-1.0, 0.2, 0.0)).foot(FootR, d(1.0, 0.0, 0.0), Vec3::Y);
-        b.limb(UpperArmL, d(-0.85, -0.12, -0.5), d(-0.35, -0.05, 0.95));
-        b.limb(UpperArmR, d(-0.8, -0.12, 0.55), d(-0.3, -0.05, -0.95));
-        b.hand(HandL, d(-0.4, 0.0, 1.0), Vec3::Y).hand(HandR, d(-0.4, 0.0, -1.0), Vec3::Y);
-        add("Lying on back, knee raised", 20.0, 25.0, b.done());
-    }
-
-    // 11. Tall kneeling with hands on the hips.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.54, 0.0).spine(d(0.06, 1.0, 0.0), d(-0.03, 1.0, 0.0), d(-0.08, 1.0, -0.04), d(-0.1, 0.0, 1.0));
-        b.head(d(0.0, 1.0, 0.0), d(-0.5, -0.05, 1.0));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let hip = b.pos(th);
-            b.ik(sh, v3(hip.x + sx * 0.02 * b.k, 0.06 * b.k, hip.z - 0.40 * b.k), d(0.0, -0.2, 1.0));
-            b.foot(ft, d(0.0, -0.3, -1.0), d(0.0, -1.0, 0.3));
-        }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let side = b.at(Pelvis, sx * 0.16, 0.06, 0.0);
-            b.ik(fa, side, d(sx, 0.0, -0.3));
-            b.hand(ha, d(-sx * 0.3, -0.6, 1.0), d(-sx, 0.0, 0.0));
-        }
-        add("Tall kneeling, hands on hips", -35.0, 8.0, b.done());
-    }
-
-    // 12. Cross-legged sitting, hands on the knees.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.05), d(0.0, 1.0, 0.03), d(0.0, 1.0, 0.05), Vec3::Z);
-        b.head(d(0.08, 1.0, 0.0), d(0.0, -0.1, 1.0));
-        b.ik(ShinL, b.off(Vec3::ZERO, -0.16, 0.06, 0.30), d(1.0, 0.25, 0.6));
-        b.ik(ShinR, b.off(Vec3::ZERO, 0.17, 0.06, 0.13), d(-1.0, 0.25, 0.6));
-        b.foot(FootL, d(-1.0, 0.0, -0.2), d(0.0, 0.3, 1.0)).foot(FootR, d(1.0, 0.0, -0.2), d(0.0, 0.3, 1.0));
-        for (sx, fa, ha, sh) in [(1.0, ForearmL, HandL, ShinL), (-1.0, ForearmR, HandR, ShinR)] {
-            let knee = b.pos(sh);
-            b.ik(fa, b.off(knee, -sx * 0.03, 0.08, -0.06), d(sx, 0.0, -0.5));
-            b.hand(ha, d(0.0, -0.6, 1.0), d(0.0, -1.0, 0.0));
-        }
-        add("Cross-legged", 25.0, 12.0, b.done());
-    }
-
-    // 13. Sitting with the legs out, leaning back on the hands, one knee up.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.35), d(0.0, 1.0, -0.3), d(0.0, 1.0, -0.25), Vec3::Z);
-        b.head(d(0.0, 1.0, 0.05), d(0.1, 0.0, 1.0));
-        b.best(-0.2, 0.2, 80, |b, t| {
-            b.limb(ThighL, d(0.05, t, 1.0), d(0.02, t, 1.0));
-            b.foot(FootL, d(0.05, 1.0, 0.25), d(0.0, 0.25, -1.0));
-            (b.min_y_of(&[Pelvis, ThighL]) - b.min_y_of(&[FootL])).abs()
+        b.root(0.0, 0.14, 0.0);
+        b.best(0.2, 1.2, 80, |b, t| {
+            b.spine(d(0.05, 1.0, 0.2 + t * 0.3), d(0.0, 1.0, 0.1 + t * 0.6), d(-0.05, 1.0, t), d(-0.15, 0.0, 1.0));
+            for (sx, th, sh, ft) in SIDES {
+                b.kneel(th, sh, v3(sx * 0.10 - 0.08, 0.05, 0.38), v3(0.26 + sx * 0.05, 0.05, -0.02));
+                b.foot(ft, d(0.4, -0.2, -1.0), d(0.0, -1.0, 0.0));
+            }
+            b.reach_err(ForearmL, -0.12, 0.30, 0.50)
         });
-        let hip = b.pos(ThighR);
-        let floor = b.min_y_of(&[Pelvis]);
-        b.ik(ShinR, v3(hip.x - 0.04 * b.k, floor + 0.075 * b.k, hip.z + 0.6 * b.k), d(0.0, 1.0, 0.2));
-        b.foot(FootR, Vec3::Z, Vec3::Y);
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
-            let sh = b.pos(fa.parent().unwrap());
-            b.ik(fa, v3(sh.x + sx * 0.05 * b.k, floor + 0.028 * b.k, sh.z - 0.14 * b.k), d(0.0, 0.0, 1.0));
-            b.hand(ha, d(sx * 0.2, -0.12, -1.0), d(0.0, -1.0, 0.0));
+        b.head(d(0.0, 0.8, 0.6), d(-0.1, -0.8, 0.6));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, -sx * 0.12 - 0.04, 0.30, d(sx * 0.4, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.25, -0.1, 1.0), -Vec3::Y);
         }
-        add("Sitting, leaning back on hands", 60.0, 10.0, b.done());
+        add("Mermaid sit, leaning on hands", 40.0, 10.0, b.done());
     }
 
-    // 14. Curled up on the left side.
+    // 17. Sitting with the legs to the side, looking aside (seen from behind).
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.15, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), -Vec3::Z);
-        let shin_l = d(1.0, 0.0, 0.1);
-        let shin_r = d(1.0, -0.12, 0.0);
-        b.limb(ThighL, d(-0.72, 0.0, -0.7), shin_l).limb(ThighR, d(-0.78, -0.12, -0.62), shin_r);
-        b.foot(FootL, d(0.3, 0.0, -1.0), -shin_l).foot(FootR, d(0.3, -0.1, -1.0), -shin_r);
-        // Tilt the curled spine so the shoulder and the hip both rest on the floor.
-        b.best(-0.1, 0.5, 60, |b, t| {
-            b.orient(Waist, d(-1.0, t * 0.5, -0.25), -Vec3::Z).orient(Chest, d(-0.92, t, -0.4), -Vec3::Z);
-            b.limb(UpperArmL, d(-0.25, 0.0, -1.0), d(-0.9, 0.05, -0.2));
-            (b.min_y_of(&[UpperArmL, Chest]) - b.min_y_of(&[Pelvis, ThighL])).abs()
+        b.root(0.0, 0.12, 0.0).spine(d(0.1, 1.0, -0.05), d(0.12, 1.0, 0.0), d(0.02, 1.0, 0.0), d(0.1, 0.0, 1.0));
+        b.head(d(-0.05, 1.0, 0.0), d(-1.0, -0.08, -0.1));
+        b.best(-0.3, 0.3, 60, |b, t| {
+            b.limb(ThighL, d(0.15, t, 1.0), d(-1.0, -0.02, -0.4));
+            b.limb(ThighR, d(-0.55, t + 0.04, 0.8), d(-0.45, -0.02, -1.0));
+            (b.min_y_of(&[Pelvis]) - b.min_y_of(&[ThighL, ShinL, ShinR, ThighR])).abs()
         });
-        b.head(d(-0.85, -0.05, -0.5), d(-0.45, -0.1, -1.0));
-        b.limb(UpperArmR, d(0.15, -0.55, -0.85), d(-0.45, -0.45, -0.75));
-        b.hand(HandL, d(-0.9, 0.05, -0.2), d(0.0, 1.0, 0.0)).hand(HandR, d(-0.3, -0.25, -1.0), d(0.0, -1.0, 0.0));
-        add("Curled up on side", 190.0, 35.0, b.done());
+        b.foot(FootL, d(-1.0, 0.0, -0.4), d(0.0, 0.3, -1.0)).foot(FootR, d(-0.5, 0.0, -1.0), d(0.0, 0.3, -1.0));
+        b.hand_floor(ForearmL, 0.15, 0.10, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(0.3, 0.0, 0.8), -Vec3::Y);
+        let knee = b.pos(ShinL);
+        b.ik(ForearmR, b.off(knee, -0.08, 0.08, -0.10), d(-1.0, -0.4, -0.2));
+        b.hand(HandR, d(0.3, -0.5, 0.6), -Vec3::Y);
+        add("Sitting with legs to the side, from behind", -155.0, 8.0, b.done());
     }
 
-    // 15. Lying on the back with both knees up, a hand on the stomach.
+    // 18. Lying on the back, knees up, hands behind the head.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.10, 0.0).spine(d(-1.0, 0.0, 0.0), d(-1.0, 0.0, 0.0), d(-1.0, 0.05, 0.0), Vec3::Y);
-        b.head(d(-1.0, 0.1, 0.0), d(0.1, 1.0, 0.6));
+        b.root(0.0, 0.10, 0.0).spine(d(-1.0, 0.0, 0.0), d(-1.0, 0.03, 0.0), d(-1.0, 0.1, 0.0), Vec3::Y);
+        b.head(d(-1.0, 0.25, 0.0), d(0.25, 1.0, 0.1));
         for (sz, th, sh, ft) in [(-1.0, ThighL, ShinL, FootL), (1.0, ThighR, ShinR, FootR)] {
             let hip = b.pos(th);
-            b.ik(sh, v3(hip.x + 0.5 * b.k, 0.075 * b.k, hip.z + sz * 0.06 * b.k), d(0.0, 1.0, sz * 0.15));
+            b.ik(sh, v3(hip.x + 0.48 * b.k, 0.075 * b.k, hip.z + sz * 0.04 * b.k), d(0.0, 1.0, -sz * 0.1));
             b.foot(ft, d(1.0, 0.0, sz * 0.1), Vec3::Y);
         }
-        b.limb(UpperArmL, d(0.9, -0.08, -0.35), d(1.0, -0.05, -0.15));
-        b.hand(HandL, d(1.0, -0.1, 0.0), -Vec3::Y);
-        let belly = b.at(Waist, 0.0, 0.05, 0.13);
-        b.ik(ForearmR, belly, d(0.2, -0.2, 1.0));
-        b.hand(HandR, d(0.1, 0.0, -1.0), -Vec3::Y);
-        add("Lying on back, knees up", 30.0, 30.0, b.done());
-    }
-
-    // 16. Lying on the stomach, head turned, arms folded under the head.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.10, 0.0).spine(Vec3::Z, d(0.0, 0.02, 1.0), d(0.0, 0.04, 1.0), -Vec3::Y);
-        b.head(d(0.0, 0.25, 1.0), d(1.0, -0.35, 0.0));
-        for (sx, ua) in [(1.0, UpperArmL), (-1.0, UpperArmR)] {
-            b.limb(ua, d(sx * 0.45, -0.1, 0.9), d(-sx * 1.0, 0.0, 0.1));
+        for (sz, fa, ha) in [(-1.0, ForearmL, HandL), (1.0, ForearmR, HandR)] {
+            let nape = b.at(Head, -sz * 0.03, 0.06, -0.11);
+            b.ik(fa, nape, d(-0.3, 0.6, sz));
+            b.hand(ha, d(0.0, -0.3, -sz), d(1.0, 0.0, 0.0));
         }
-        b.hand(HandL, d(-1.0, 0.0, 0.1), -Vec3::Y).hand(HandR, d(1.0, 0.0, 0.1), -Vec3::Y);
-        b.limb(ThighL, d(0.55, -0.08, -0.85), d(-0.25, -0.02, -1.0));
-        b.limb(ThighR, d(-0.08, -0.06, -1.0), d(-0.02, -0.02, -1.0));
-        b.foot(FootL, d(0.0, -0.3, -1.0), d(0.3, -1.0, 0.0)).foot(FootR, d(0.0, -0.3, -1.0), d(0.0, -1.0, 0.0));
-        add("Lying on stomach, head on arms", 125.0, 28.0, b.done());
+        add("Lying on back, hands behind head", 115.0, 25.0, b.done());
     }
 
-    // 17. Kneeling on one knee, forearm resting on the raised knee.
+    // 19. Kneeling with the chest down on the forearms, hips high.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.52, 0.0).spine(d(0.0, 1.0, 0.05), d(0.0, 1.0, 0.2), d(0.0, 1.0, 0.38), Vec3::Z);
-        b.head(d(0.0, 1.0, 0.0), d(0.0, -0.05, 1.0));
-        let hip_l = b.pos(ThighL);
-        b.ik(ShinL, v3(hip_l.x + 0.03 * b.k, 0.062 * b.k, hip_l.z + 0.46 * b.k), d(0.0, 1.0, 1.0));
-        b.foot(FootL, Vec3::Z, Vec3::Y);
-        let hip_r = b.pos(ThighR);
-        b.ik(ShinR, v3(hip_r.x - 0.01 * b.k, 0.15 * b.k, hip_r.z - 0.40 * b.k), d(0.0, -1.0, 0.3));
-        b.foot(FootR, d(0.0, -0.75, 0.45), d(0.0, 0.45, 0.75));
-        let knee = b.pos(ShinL);
-        b.ik(ForearmL, b.off(knee, -0.08, 0.07, 0.10), d(0.2, -1.0, -0.2));
-        b.hand(HandL, d(-0.3, -0.6, 0.6), d(-1.0, 0.0, 0.0));
-        let hip = b.at(Pelvis, -0.15, 0.03, 0.04);
-        b.ik(ForearmR, hip, d(-1.0, 0.0, -0.3));
-        b.hand(HandR, d(0.0, -0.6, 1.0), d(1.0, 0.0, 0.0));
-        add("One-knee kneel", 60.0, 8.0, b.done());
-    }
-
-    // 18. Sitting, hugging one knee, the other leg folded flat.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.15), d(0.05, 1.0, 0.15), d(0.12, 1.0, 0.35), Vec3::Z);
-        b.head(d(0.35, 1.0, 0.2), d(-0.3, -0.25, 1.0));
-        b.ik(ShinL, b.off(Vec3::ZERO, 0.13, 0.075, 0.36), d(0.0, 1.0, 0.3));
-        b.foot(FootL, Vec3::Z, Vec3::Y);
-        b.ik(ShinR, b.off(Vec3::ZERO, 0.0, 0.06, 0.22), d(-1.0, 0.1, 0.4));
-        b.foot(FootR, d(1.0, 0.0, -0.1), d(0.0, 0.3, 1.0));
-        let knee = b.pos(ShinL);
-        b.ik(ForearmL, b.off(knee, 0.03, -0.08, 0.10), d(1.0, -0.2, -0.3));
-        b.hand(HandL, d(-1.0, 0.0, 0.0), d(0.0, 0.0, -1.0));
-        b.ik(ForearmR, b.off(knee, 0.05, -0.12, 0.10), d(-1.0, -0.2, -0.3));
-        b.hand(HandR, d(1.0, 0.0, 0.0), d(0.0, 0.0, -1.0));
-        add("Hugging one knee", 35.0, 12.0, b.done());
-    }
-
-    // 19. Low asymmetric crouch, one hand touching the floor, looking aside.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.32, 0.0).spine(d(0.0, 1.0, 0.3), d(0.0, 1.0, 0.45), d(-0.1, 1.0, 0.55), d(-0.15, 0.0, 1.0));
-        b.head(d(0.0, 1.0, 0.15), d(-0.9, -0.2, 0.5));
-        let hip_l = b.pos(ThighL);
-        b.ik(ShinL, b.off(Vec3::ZERO, 0.17, 0.06, 0.10), b.off(Vec3::ZERO, 0.22, 0.52, 0.30) - hip_l);
-        b.foot(FootL, d(0.15, 0.0, 1.0), Vec3::Y);
-        let hip_r = b.pos(ThighR);
-        b.ik(ShinR, b.off(Vec3::ZERO, -0.16, 0.14, -0.12), b.off(Vec3::ZERO, -0.2, 0.2, 0.32) - hip_r);
-        b.foot(FootR, d(-0.1, -0.6, 1.0), d(0.0, 1.0, 0.6));
-        b.ik(ForearmR, b.off(Vec3::ZERO, -0.05, 0.03, 0.42), d(-0.5, 0.0, -1.0));
-        b.hand(HandR, d(0.0, 0.0, 1.0), -Vec3::Y);
-        let knee = b.pos(ShinL);
-        b.ik(ForearmL, b.off(knee, -0.02, -0.08, 0.14), d(0.5, -0.3, -1.0));
-        b.hand(HandL, d(0.0, -1.0, 0.2), d(-1.0, 0.0, 0.0));
-        add("Low crouch, hand on floor", -30.0, 8.0, b.done());
-    }
-
-    // 20. Lying on the right side, head on the outstretched arm, top knee forward.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.15, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), Vec3::Z);
-        b.limb(ThighR, d(1.0, -0.06, 0.12), d(1.0, -0.02, -0.12));
-        b.limb(ThighL, d(0.35, -0.32, 0.9), d(0.95, -0.15, -0.25));
-        b.foot(FootR, d(0.2, 0.0, 1.0), d(-1.0, 0.0, 0.0)).foot(FootL, d(0.3, -0.3, 1.0), d(-1.0, 0.0, 0.0));
-        b.best(-0.1, 0.5, 60, |b, t| {
-            b.orient(Waist, d(-1.0, t * 0.5, 0.0), Vec3::Z).orient(Chest, d(-1.0, t, 0.0), Vec3::Z);
-            b.limb(UpperArmR, d(-1.0, 0.0, 0.08), d(-1.0, 0.0, 0.1));
-            (b.min_y_of(&[UpperArmR, Chest]) - b.min_y_of(&[Pelvis, ThighR])).abs()
-        });
-        b.hand(HandR, d(-1.0, 0.0, 0.1), -Vec3::Y);
-        b.head(d(-1.0, 0.25, 0.0), d(0.0, 0.0, 1.0));
-        let chest = b.pos(Chest);
-        let floor = b.min_y_of(&[Pelvis, ThighR]);
-        b.ik(ForearmL, v3(chest.x - 0.02 * b.k, floor + 0.03 * b.k, chest.z + 0.32 * b.k), d(0.3, 1.0, 0.2));
-        b.hand(HandL, d(-0.4, -0.1, 1.0), -Vec3::Y);
-        add("Side-lying, head on arm", 10.0, 30.0, b.done());
-    }
-
-    // 21. Seated forward bend, reaching for the toes.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.12, 0.0).spine(d(0.0, 0.85, 0.55), d(0.0, 0.6, 0.8), d(0.0, 0.42, 0.9), Vec3::Z);
-        b.head(d(0.0, 0.45, 0.9), d(0.0, -0.9, 0.45));
-        b.best(-0.2, 0.2, 80, |b, t| {
-            for (sx, th, ft) in [(1.0, ThighL, FootL), (-1.0, ThighR, FootR)] {
-                b.limb(th, d(sx * 0.07, t, 1.0), d(sx * 0.01, t, 1.0));
-                b.foot(ft, d(sx * 0.1, 1.0, 0.15), d(0.0, 0.15, -1.0));
-            }
-            (b.min_y_of(&[Pelvis, ThighL]) - b.min_y_of(&[FootL])).abs()
-        });
-        for (sx, fa, ha, ft) in [(1.0, ForearmL, HandL, FootL), (-1.0, ForearmR, HandR, FootR)] {
-            let foot = b.pos(ft);
-            b.ik(fa, b.off(foot, sx * 0.02, 0.07, -0.12), d(sx, 0.4, 0.0));
-            b.hand(ha, d(0.0, 0.1, 1.0), d(-sx, 0.0, 0.0));
-        }
-        add("Seated forward bend", 55.0, 15.0, b.done());
-    }
-
-    // 22. Kneeling, leaning back on the hands, looking up.
-    {
-        let mut b = B::new(s);
-        b.root(0.0, 0.30, 0.0).spine(d(0.0, 1.0, -0.3), d(0.0, 1.0, -0.45), d(0.0, 1.0, -0.6), Vec3::Z);
-        b.head(d(0.0, 1.0, -0.15), d(0.0, 0.45, 1.0));
-        for (sx, th, sh, ft) in [(1.0, ThighL, ShinL, FootL), (-1.0, ThighR, ShinR, FootR)] {
-            let knee = b.off(Vec3::ZERO, sx * 0.13, 0.05, 0.38);
+        b.root(0.0, 0.48, 0.0).spine(d(0.0, -0.3, 1.0), d(0.0, -0.6, 1.0), d(0.0, -0.45, 1.0), -Vec3::Y);
+        b.head(d(0.3, 0.1, 1.0), d(0.6, -0.8, 0.1));
+        for (sx, th, sh, ft) in SIDES {
             let hip = b.pos(th);
-            b.ik(sh, b.off(Vec3::ZERO, sx * 0.08, 0.065, -0.03), knee - hip);
-            b.foot(ft, d(-sx * 0.1, -0.3, -1.0), d(0.0, -1.0, -0.3));
+            b.ik(sh, v3(hip.x + sx * 0.04 * b.k, 0.15 * b.k, hip.z - 0.38 * b.k), d(0.0, -1.0, 1.0));
+            b.foot(ft, d(0.0, -1.0, 0.2), d(0.0, 0.2, 1.0));
         }
-        for (sx, fa, ha) in [(1.0, ForearmL, HandL), (-1.0, ForearmR, HandR)] {
+        let floor = b.floor();
+        for (sx, ua, fa, ha) in ARMS {
+            let sh = b.pos(ua);
+            let elbow = v3(sh.x + sx * 0.03 * b.k, floor + 0.04 * b.k, sh.z + 0.05 * b.k);
+            let upper = (elbow - sh).normalized();
+            b.limb(ua, upper, d(-sx * 0.6, 0.0, 1.0));
+            let _ = fa;
+            b.hand(ha, d(-sx * 0.6, 0.0, 1.0), -Vec3::Y);
+        }
+        add("Kneeling, chest down on forearms", -150.0, 20.0, b.done());
+    }
+
+    // 20. Sitting, hugging both knees, arms crossed over them.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.12, 0.0).spine(d(0.0, 1.0, -0.25), d(0.0, 1.0, 0.1), d(0.0, 1.0, 0.3), Vec3::Z);
+        b.head(d(0.0, 1.0, 0.1), d(0.0, -0.15, 1.0));
+        for (sx, _, sh, ft) in SIDES {
+            b.ik(sh, b.off(Vec3::ZERO, sx * 0.09, 0.075, 0.36), d(sx * 0.1, 1.0, 0.3));
+            b.foot(ft, d(0.0, 0.0, 1.0), Vec3::Y);
+        }
+        let mid = b.pos(ShinL).lerp(b.pos(ShinR), 0.5);
+        for (sx, _, fa, ha) in ARMS {
+            let elbow = b.off(mid, sx * 0.20, -0.06, 0.0);
+            let wrist = b.off(mid, -sx * 0.10, -0.03 + sx * 0.02, 0.10);
             let sh = b.pos(fa.parent().unwrap());
-            b.ik(fa, v3(sh.x + sx * 0.08 * b.k, 0.03 * b.k, sh.z - 0.2 * b.k), d(0.0, 0.0, 1.0));
-            b.hand(ha, d(sx * 0.2, 0.0, -1.0), -Vec3::Y);
+            b.ik(fa, wrist, elbow - sh.lerp(wrist, 0.5));
+            b.hand(ha, d(-sx, -0.3, -0.2), d(0.0, 0.0, -1.0));
         }
-        add("Kneeling, leaning back", 70.0, 8.0, b.done());
+        add("Sitting, hugging both knees", 32.0, 8.0, b.done());
     }
 
-    // 23. Crawling: on all fours, one arm reaching forward, looking ahead.
+    // 21. Lying on the front, propped on a forearm, head resting on the hand.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.47, 0.0).spine(d(0.03, 0.12, 1.0), d(0.0, 0.18, 1.0), d(-0.05, 0.2, 1.0), d(0.1, -1.0, 0.0));
-        b.head(d(0.0, 1.0, 0.55), d(0.0, -0.3, 1.0));
-        let hip_l = b.pos(ThighL);
-        b.ik(ShinL, v3(hip_l.x + 0.02 * b.k, 0.055 * b.k, hip_l.z - 0.36 * b.k), d(0.0, -1.0, 1.0));
-        let hip_r = b.pos(ThighR);
-        b.ik(ShinR, v3(hip_r.x - 0.03 * b.k, 0.055 * b.k, hip_r.z - 0.22 * b.k), d(0.0, -1.0, 1.0));
-        b.foot(FootL, d(0.0, -0.2, -1.0), d(0.0, -1.0, 0.2)).foot(FootR, d(0.0, -0.1, -1.0), d(0.0, -1.0, 0.1));
-        let sh_l = b.pos(UpperArmL);
-        b.ik(ForearmL, v3(sh_l.x + 0.03 * b.k, 0.035 * b.k, sh_l.z + 0.22 * b.k), d(0.0, 0.5, -1.0));
-        b.hand(HandL, d(0.0, 0.0, 1.0), -Vec3::Y);
-        let sh_r = b.pos(UpperArmR);
-        b.ik(ForearmR, v3(sh_r.x - 0.03 * b.k, 0.035 * b.k, sh_r.z - 0.02 * b.k), d(0.0, 0.0, -1.0));
-        b.hand(HandR, d(0.1, 0.0, 1.0), -Vec3::Y);
-        add("Crawling, reaching forward", -60.0, 12.0, b.done());
+        b.root(0.0, 0.11, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), d(0.0, -1.0, 0.45));
+        b.orient(Waist, d(-1.0, 0.12, 0.0), d(0.0, -1.0, 0.4)).orient(Chest, d(-1.0, 0.38, 0.0), d(0.0, -1.0, 0.45));
+        b.head(d(-0.6, 1.0, 0.45), d(-0.6, -0.2, 0.8));
+        let floor = b.floor();
+        let sh = b.pos(UpperArmL);
+        let elbow = v3(sh.x - 0.12 * b.k, floor + 0.045 * b.k, sh.z + 0.06 * b.k);
+        let cheek = b.at(Head, 0.07, 0.04, 0.04);
+        b.limb(UpperArmL, (elbow - sh).normalized(), cheek - elbow);
+        b.hand(HandL, (cheek - elbow).normalized(), d(1.0, 0.0, -0.5));
+        b.hand_floor(ForearmR, 0.12, 0.34, d(-0.5, 1.0, 0.0));
+        b.hand(HandR, d(0.5, 0.0, 1.0), -Vec3::Y);
+        b.limb(ThighL, d(1.0, -0.3, 0.45), d(0.6, 0.05, -0.8));
+        b.limb(ThighR, d(1.0, -0.3, 0.15), d(0.7, 0.0, -0.7));
+        b.foot(FootL, d(0.5, 0.0, -0.8), d(0.0, -1.0, 0.0)).foot(FootR, d(0.6, 0.0, -0.7), d(0.0, -1.0, 0.0));
+        add("Lying on front, head on hand", -38.0, 8.0, b.done());
     }
 
-    // 24. Supine twist: knees dropped to one side, arms out.
+    // 22. All fours, looking back over the shoulder, one hand forward.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.10, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), d(0.0, 0.55, 0.85));
-        b.orient(Waist, d(-1.0, 0.0, 0.0), d(0.0, 0.85, 0.5)).orient(Chest, d(-1.0, 0.0, 0.0), Vec3::Y);
-        b.head(d(-1.0, 0.1, 0.0), d(0.0, 0.65, -0.75));
-        b.best(-0.4, 0.4, 80, |b, t| {
-            b.limb(ThighR, d(-0.25, t, 1.0), d(1.0, -0.05, 0.1));
-            b.limb(ThighL, d(-0.15, t + 0.3, 1.0), d(1.0, -0.1, 0.15));
-            (b.min_y_of(&[Chest, Pelvis]) - b.min_y_of(&[ThighR, ShinR])).abs()
-        });
-        b.foot(FootR, d(0.2, 0.0, 1.0), d(-1.0, 0.0, 0.0)).foot(FootL, d(0.2, -0.2, 1.0), d(-1.0, 0.0, 0.0));
-        b.limb(UpperArmL, d(0.05, -0.05, -1.0), d(0.0, 0.0, -1.0));
-        b.limb(UpperArmR, d(-0.45, -0.05, 1.0), d(-0.4, 0.0, 1.0));
-        b.hand(HandL, d(0.0, 0.0, -1.0), Vec3::Y).hand(HandR, d(-0.4, 0.0, 1.0), Vec3::Y);
-        add("Supine twist", 10.0, 72.0, b.done());
+        b.root(0.0, 0.48, 0.0).spine(d(0.0, 0.05, 1.0), d(0.0, 0.1, 1.0), d(-0.1, 0.25, 1.0), d(-0.25, -1.0, 0.0));
+        b.head(d(-0.2, 1.0, 0.5), d(-1.0, -0.1, 0.1));
+        for (sx, th, sh, ft) in SIDES {
+            let hip = b.pos(th);
+            b.ik(sh, v3(hip.x + sx * 0.03 * b.k, 0.055 * b.k, hip.z - 0.38 * b.k), d(0.0, -1.0, 1.0));
+            b.foot(ft, d(0.0, -0.45, -1.0), d(0.0, -1.0, 0.45));
+        }
+        b.hand_floor(ForearmL, 0.03, 0.02, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(-0.1, 0.0, 1.0), -Vec3::Y);
+        b.hand_floor(ForearmR, -0.04, 0.24, d(0.0, 0.0, -1.0));
+        b.hand(HandR, d(0.2, 0.0, 1.0), -Vec3::Y);
+        add("All fours, looking back", -140.0, 10.0, b.done());
     }
 
-    // 25. Reclining on both elbows, ankles crossed.
+    // 23. Frog kneel: knees wide apart, hands on the floor between them.
     {
         let mut b = B::new(s);
-        b.root(0.0, 0.11, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), Vec3::Y);
-        // Raise the chest until the elbows (under the shoulders) reach the floor level of the hips.
-        b.best(0.0, 1.2, 120, |b, t| {
-            b.orient(Waist, d(-1.0, 0.35 * t, 0.0), Vec3::Y).orient(Chest, d(-0.8, 0.6 * t + 0.05, 0.0), Vec3::Y);
-            for (sz, ua) in [(-1.0, UpperArmL), (1.0, UpperArmR)] {
-                b.limb(ua, d(-0.3, -1.0, sz * 0.2), d(1.0, -0.02, sz * 0.12));
+        b.root(0.0, 0.17, 0.0);
+        b.best(0.0, 0.9, 90, |b, t| {
+            b.spine(d(0.0, 1.0, 0.1 + t * 0.3), d(0.0, 1.0, 0.05 + t * 0.4), d(0.0, 1.0, t), Vec3::Z);
+            for (sx, th, sh, ft) in SIDES {
+                b.kneel(th, sh, v3(sx * 0.42, 0.05, 0.22), v3(sx * 0.36, 0.05, -0.20));
+                b.foot(ft, d(-sx * 0.5, -0.4, -1.0), d(0.0, -1.0, 0.3));
             }
-            (b.min_y_of(&[ForearmL, UpperArmL]) - b.min_y_of(&[Pelvis])).abs()
+            b.reach_err(ForearmL, -0.13, 0.15, 0.51) + 0.02 * t
         });
-        b.head(d(-0.25, 1.0, 0.0), d(1.0, 0.2, 0.0));
-        for (sz, ha) in [(-1.0, HandL), (1.0, HandR)] {
-            b.hand(ha, d(1.0, -0.05, sz * 0.1), -Vec3::Y);
+        b.head(d(0.0, 1.0, 0.1), d(0.0, -0.3, 1.0));
+        for (sx, _, fa, ha) in ARMS {
+            b.hand_floor(fa, -sx * 0.13, 0.15, d(sx * 0.3, 0.0, -1.0));
+            b.hand(ha, d(-sx * 0.25, -0.1, 1.0), -Vec3::Y);
         }
-        b.best(-0.2, 0.2, 80, |b, t| {
-            b.limb(ThighL, d(1.0, t, 0.02), d(1.0, t + 0.02, 0.08));
-            b.limb(ThighR, d(1.0, t + 0.03, -0.02), d(1.0, t + 0.06, -0.08));
-            b.foot(FootL, d(0.35, 1.0, 0.25), d(-1.0, 0.35, 0.0)).foot(FootR, d(0.35, 1.0, -0.25), d(-1.0, 0.35, 0.0));
-            (b.min_y_of(&[Pelvis]) - b.min_y_of(&[FootL, FootR, ShinL, ShinR])).abs()
+        add("Frog kneel, hands on floor", 0.0, 5.0, b.done());
+    }
+
+    // 24. Lying on the back, knees raised to one side, arm out on the floor.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.10, 0.0).orient(Pelvis, d(-1.0, 0.0, 0.0), d(0.0, 0.85, 0.5));
+        b.orient(Waist, d(-1.0, 0.0, 0.0), d(0.0, 0.9, 0.42)).orient(Chest, d(-1.0, 0.05, 0.0), d(0.0, 0.75, 0.65));
+        b.head(d(-1.0, 0.1, 0.1), d(0.0, 0.45, 0.9));
+        b.limb(ThighR, d(0.25, 1.0, 0.25), d(0.8, -0.55, 0.0));
+        b.limb(ThighL, d(0.95, 0.35, -0.1), d(0.25, 0.25, 0.95));
+        b.foot(FootR, d(0.8, -0.55, 0.0), d(0.55, 0.8, 0.0)).foot(FootL, d(0.4, 0.2, 0.9), d(-0.2, 1.0, 0.0));
+        b.limb(UpperArmR, d(0.55, -0.2, 0.8), d(1.0, -0.08, 0.3));
+        b.hand(HandR, d(1.0, -0.05, 0.25), -Vec3::Y);
+        let belly = b.at(Waist, 0.02, 0.06, 0.14);
+        b.ik(ForearmL, belly, d(0.0, 0.3, -1.0));
+        b.hand(HandL, d(0.3, 0.0, 1.0), d(0.0, -1.0, -0.5));
+        add("Lying on back, legs raised", 12.0, 18.0, b.done());
+    }
+
+    // 25. Sitting with the legs folded to the right, leaning on the left hand.
+    {
+        let mut b = B::new(s);
+        b.root(0.0, 0.12, 0.0).spine(d(0.15, 1.0, 0.0), d(0.18, 1.0, -0.02), d(0.06, 1.0, -0.05), d(0.3, 0.0, 1.0));
+        b.head(d(-0.15, 1.0, 0.0), d(-0.35, -0.1, 1.0));
+        b.best(-0.3, 0.3, 60, |b, t| {
+            b.limb(ThighL, d(-0.55, t, 0.85), d(-0.8, -0.02, -0.6));
+            b.limb(ThighR, d(-0.85, t + 0.04, 0.45), d(-0.3, -0.02, -0.95));
+            (b.min_y_of(&[Pelvis]) - b.min_y_of(&[ThighL, ShinL, ShinR, ThighR])).abs()
         });
-        add("Reclining on elbows", 25.0, 14.0, b.done());
+        b.foot(FootL, d(-0.8, 0.0, -0.5), d(0.0, 0.3, -1.0)).foot(FootR, d(-0.3, 0.0, -1.0), d(0.0, 0.3, -1.0));
+        b.hand_floor(ForearmL, 0.30, -0.08, d(0.0, 0.0, -1.0));
+        b.hand(HandL, d(0.7, -0.1, -0.3), d(0.0, -1.0, 0.0));
+        let thigh = b.at(ThighL, 0.0, -0.25, 0.04);
+        b.ik(ForearmR, thigh, d(-1.0, -0.3, -0.4));
+        b.hand(HandR, d(0.5, -0.4, 0.5), d(0.0, -1.0, 0.0));
+        add("Sitting, legs folded, leaning on hand", 25.0, 10.0, b.done());
     }
 
     v

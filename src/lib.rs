@@ -13,6 +13,7 @@ pub mod body;
 pub mod cli;
 pub mod export;
 pub mod ik;
+pub mod lineart;
 pub mod math;
 pub mod pose_io;
 pub mod posing;
